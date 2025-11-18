@@ -167,7 +167,11 @@ az iot dps enrollment-group create \
     --dps-name "$DPS_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --enrollment-id "$ENROLLMENT_ID" \
-    --credential-policy "$POLICY_NAME"
+    --credential-policy "$POLICY_NAME" \
+    --ih "$HUB_NAME.azure-devices.net" \
+    --allocation-policy "static"
+
+set +x
 
 echo ""
 echo "=================================================="
