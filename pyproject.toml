@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "azure-identity==1.23.0",
+    "azure-iot-device",
+    "locust>=2.32.4",
 ]
 
 [dependency-groups]
@@ -34,6 +36,10 @@ disallow_untyped_defs = true
 warn_unused_ignores = true
 explicit_package_bases = true
 
+[[tool.mypy.overrides]]
+module = "locust_pkg.locustfile"
+disallow_untyped_calls = false
+
 [tool.pytest.ini_options]
 testpaths = [
   "tests"
@@ -43,3 +49,6 @@ pythonpath = [
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.uv.sources]
+azure-iot-device = { path = "wheels/azure_iot_device-2.14.0.tar.gz" }

@@ -30,10 +30,20 @@ test: ## Test the code with pytest
 	@echo "Testing code: Running pytest"
 	@uv run pytest tests --disable-warnings -v
 
+.PHONY: run
+run: ## Run locust load test
+	@echo "Running locust load test"
+	@uv run locust -f src/locust_pkg --headless --autostart --run-time 1m TestUser
+
 .PHONY: build
 build: clean-build ## Build wheel file
 	@echo "Creating wheel file"
 	@uvx --from build pyproject-build --installer uv
+
+.PHONY: wheel
+wheel: ## Build wheel file using uv build
+	@echo "Creating wheel file with uv build"
+	@uv build --wheel
 
 .PHONY: clean-build
 clean-build: ## Clean build artifacts

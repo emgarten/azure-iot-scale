@@ -42,6 +42,12 @@ def x509_certificate_list_to_pem(cert_list: list[str]) -> str:
 async def main() -> None:
     if dps_sas_key is not None:
         print("Using symmetric-key authentication")
+        # Validate required environment variables
+        if provisioning_host is None or registration_id is None or id_scope is None:
+            print(
+                "Missing required environment variables: PROVISIONING_HOST, PROVISIONING_IDSCOPE, or PROVISIONING_REGISTRATION_ID"
+            )
+            sys.exit(1)
         provisioning_device_client = ProvisioningDeviceClient.create_from_symmetric_key(
             provisioning_host=provisioning_host,
             registration_id=registration_id,
@@ -60,6 +66,11 @@ async def main() -> None:
     print("The complete registration result is")
     print(vars(registration_result.registration_state))
 
+    # Validate registration state exists
+    if registration_result.registration_state is None:
+        print("Registration failed: no registration state returned")
+        sys.exit(1)
+
     if issued_cert_file is not None:
         with open(issued_cert_file, "w") as out_ca_pem:
             # Write the issued certificate on the file.
@@ -73,7 +84,7 @@ async def main() -> None:
         iot_hub_x509 = X509(
             cert_file=issued_cert_file,
             key_file=csr_key_file,
-        )
+        )  # type: ignore[no-untyped-call]
 
         device_client = IoTHubDeviceClient.create_from_x509_certificate(
             hostname=registration_result.registration_state.assigned_hub,
@@ -86,7 +97,7 @@ async def main() -> None:
 
         async def send_test_message(i: int) -> None:
             print("sending message #" + str(i))
-            msg = Message("test wind speed " + str(i))
+            msg = Message("test wind speed " + str(i))  # type: ignore[no-untyped-call]
             msg.message_id = uuid.uuid4()
             await device_client.send_message(msg)
             print("done sending message #" + str(i))
