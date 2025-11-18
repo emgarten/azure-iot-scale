@@ -40,11 +40,6 @@ clean-build: ## Clean build artifacts
 	@echo "Removing build artifacts"
 	@uv run python -c "import shutil; import os; shutil.rmtree('dist') if os.path.exists('dist') else None"
 
-.PHONY: publish
-publish: ## Publish a release to PyPI
-@echo "Publishing."
-@uvx twine upload --repository-url https://upload.pypi.org/legacy/ dist/*
-
 .PHONY: help
 help:
 	@uv run python -c "import re; \
