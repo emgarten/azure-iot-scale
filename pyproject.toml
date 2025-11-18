@@ -1,0 +1,45 @@
+[project]
+name = "azureiotscale"
+description = "azureiotscale"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "azure-identity==1.23.0",
+]
+
+[dependency-groups]
+dev = [
+    "black==25.1.0",
+    "debugpy>=1.8.14",
+    "ipykernel>=6.29.5",
+    "mypy>=1.15.0",
+    "pytest==8.3.5",
+    "pytest-asyncio>=0.24.0",
+    "pytest-httpx>=0.35.0",
+    "ruff==0.11.10",
+]
+
+[tool.black]
+line-length = 120
+include = '\.pyi?$'
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
+ignore_missing_imports = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
+explicit_package_bases = true
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests"
+]
+pythonpath = [
+  "src"
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
