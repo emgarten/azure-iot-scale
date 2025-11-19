@@ -36,9 +36,14 @@ run: ## Run locust load test
 	@uv run locust -f src/locust_pkg --headless --autostart --run-time 1m TestUser
 
 .PHONY: build
-build: clean-build ## Build wheel file
-	@echo "Creating wheel file"
-	@uvx --from build pyproject-build --installer uv
+build: clean-build ## Create requirements.txt file in /dist
+	@echo "Creating requirements.txt in /dist"
+	@mkdir -p dist
+	@uv export --no-dev --no-hashes -o dist/requirements.txt
+	@echo "Copying wheel files to /dist"
+	@cp wheels/* dist/ 2>/dev/null || true
+	@echo "Updating requirements.txt to remove wheels folder path"
+	@sed -i 's|./wheels/|./|g' dist/requirements.txt
 
 .PHONY: wheel
 wheel: ## Build wheel file using uv build
