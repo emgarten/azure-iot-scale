@@ -3,13 +3,16 @@ import hashlib
 import hmac
 import logging
 import os
-import sys
-import uuid
+import time
 from locust import User, task, between
 from typing import Any
 
-from azure.iot.device import Message, X509
-from azure.iot.device.aio import IoTHubDeviceClient, ProvisioningDeviceClient
+from azure.iot.device import ProvisioningDeviceClient
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -20,10 +23,6 @@ id_scope = os.getenv("PROVISIONING_IDSCOPE")
 registration_id = os.getenv("PROVISIONING_REGISTRATION_ID")
 
 dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
-
-csr_data = os.getenv("PROVISIONING_CSR")
-csr_key_file = os.getenv("PROVISIONING_CSR_KEY_FILE")
-issued_cert_file = os.getenv("PROVISIONING_ISSUED_CERT_FILE")
 device_key: str = ""
 
 # Handle optional dps_sas_key and registration_id
@@ -46,50 +45,108 @@ class CertUser(User):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         logger.info("Starting CertUser")
+        self.issued_cert_data: str = ""
 
     @task
     def provision_device(self) -> None:
-        if dps_sas_key is not None:
-            print("Using symmetric-key authentication")
-            # Validate required environment variables
-            if provisioning_host is None or registration_id is None or id_scope is None:
+        # Set start time, but override it later for the relevant time.
+        start_time = time.time()
+
+        try:
+            if dps_sas_key is not None:
+                print("Using symmetric-key authentication")
+                # Validate required environment variables
+                if provisioning_host is None or registration_id is None or id_scope is None:
+                    raise Exception(
+                        "Missing required environment variables: PROVISIONING_HOST, PROVISIONING_IDSCOPE, or PROVISIONING_REGISTRATION_ID"
+                    )
+                provisioning_device_client = ProvisioningDeviceClient.create_from_symmetric_key(
+                    provisioning_host=provisioning_host,
+                    registration_id=registration_id,
+                    id_scope=id_scope,
+                    symmetric_key=device_key,
+                )
+            else:
                 raise Exception(
-                    "Missing required environment variables: PROVISIONING_HOST, PROVISIONING_IDSCOPE, or PROVISIONING_REGISTRATION_ID"
+                    "Either provide PROVISIONING_X509_CERT_FILE and PROVISIONING_X509_KEY_FILE or PROVISIONING_SAS_KEY"
                 )
-            provisioning_device_client = ProvisioningDeviceClient.create_from_symmetric_key(
-                provisioning_host=provisioning_host,
-                registration_id=registration_id,
-                id_scope=id_scope,
-                symmetric_key=device_key,
+
+            # Generate EC private key (prime256v1 = SECP256R1)
+            # Equivalent to: openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt
+            private_key = ec.generate_private_key(ec.SECP256R1())
+
+            # Generate CSR (Certificate Signing Request)
+            # Equivalent to: openssl req -new -key $key -subj "/CN=$registration_id" -outform DER | openssl base64 -A
+            if registration_id is None:
+                raise Exception("PROVISIONING_REGISTRATION_ID is required")
+
+            csr_builder = x509.CertificateSigningRequestBuilder()
+            csr_builder = csr_builder.subject_name(
+                x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, registration_id)])
             )
-        else:
-            raise Exception("Either provide PROVISIONING_X509_CERT_FILE and PROVISIONING_X509_KEY_FILE or PROVISIONING_SAS_KEY")
 
-        # TODO: replace the csr_key_file with the generated value below, implement the following openssl command using python libraries
-        # openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $PROVISIONING_CSR_KEY_FILE
+            # Sign the CSR with the private key
+            csr = csr_builder.sign(private_key, hashes.SHA256())
 
-        # TODO: Replace csr_data with generated CSR string, implement the following openssl command using python libraries
-        # export PROVISIONING_CSR=$(openssl req -new -key $PROVISIONING_CSR_KEY_FILE -subj "/CN=$PROVISIONING_REGISTRATION_ID" -outform DER | openssl base64 -A)
+            # Convert CSR to DER format and then base64 encode it
+            csr_der = csr.public_bytes(serialization.Encoding.DER)
+            csr_data = base64.b64encode(csr_der).decode("utf-8")
 
+            # Set the CSR on the client
+            provisioning_device_client.client_certificate_signing_request = csr_data
 
-        # set the CSR on the client
-        provisioning_device_client.client_certificate_signing_request = csr_data
+            # Start tracking time here
+            start_time = time.time()
 
-        # TODO: Use gevent style for locust instead of asyncio await
-        registration_result = await provisioning_device_client.register()
+            # Use synchronous register() instead of async await (gevent style for locust)
+            registration_result = provisioning_device_client.register()
 
-        # Validate registration state exists
-        if registration_result.registration_state is None:
-            # TODO: Log as a locust error instead of raising an exception
-            raise Exception("Registration failed: no registration state returned")
-
-        if issued_cert_file is not None:
-            # Save the issued certificate to self.issued_cert_file instead of writing to disk
-            with open(issued_cert_file, "w") as out_ca_pem:
-                # Write the issued certificate on the file.
-                out_ca_pem.write(
-                    x509_certificate_list_to_pem(registration_result.registration_state.issued_client_certificate)
+            # Validate registration state exists
+            if registration_result.registration_state is None:
+                # Log as a locust error instead of raising an exception
+                total_time = int((time.time() - start_time) * 1000)
+                error_msg = "Registration failed: no registration state returned"
+                logger.debug(error_msg)
+                self.environment.events.request.fire(
+                    request_type="DPS_CSR",
+                    name="device_provision",
+                    response_time=total_time,
+                    response_length=0,
+                    exception=error_msg,
+                    context={"registration_id": registration_id, "status": "error"},
                 )
+                return
+
+            # Store the issued certificate data instead of writing to disk
+            if registration_result.registration_state.issued_client_certificate:
+                self.issued_cert_data = x509_certificate_list_to_pem(
+                    registration_result.registration_state.issued_client_certificate
+                )
+
+            # Log success
+            total_time = int((time.time() - start_time) * 1000)
+            logger.debug(f"Device {registration_id} provisioned successfully")
+            self.environment.events.request.fire(
+                request_type="DPS_CSR",
+                name="device_provision",
+                response_time=total_time,
+                response_length=0,
+                exception=None,
+                context={"registration_id": registration_id, "status": registration_result.status},
+            )
+
+        except Exception as e:
+            # Log as a locust error
+            total_time = int((time.time() - start_time) * 1000)
+            logger.error(f"Device {registration_id} provisioning failed: {str(e)}")
+            self.environment.events.request.fire(
+                request_type="DPS_CSR",
+                name="device_provision",
+                response_time=total_time,
+                response_length=0,
+                exception=str(e),
+                context={"registration_id": registration_id, "status": "error"},
+            )
 
         # Connect to hub
         # if registration_result.status == "assigned":
