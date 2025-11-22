@@ -33,7 +33,7 @@ test: ## Test the code with pytest
 .PHONY: run
 run: ## Run locust load test
 	@echo "Running locust load test"
-	@uv run locust -f src/locust_pkg --headless --autostart --run-time 1m TestUser
+	@uv run locust -f src/locust_pkg --headless --autostart --run-time 1m CertUser
 
 .PHONY: build
 build: clean-build ## Create requirements.txt file in /dist

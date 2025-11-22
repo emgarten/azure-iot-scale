@@ -8,6 +8,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "gevent": true,
+            "envFile": "${workspaceFolder}/.env",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"
             }
@@ -25,6 +26,7 @@
             ],
             "console": "integratedTerminal",
             "gevent": true,
+            "envFile": "${workspaceFolder}/.env",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"
             }
