@@ -10,7 +10,6 @@ from locust import User, task, between
 from typing import Any, Optional
 
 from azure.iot.device import ProvisioningDeviceClient, IoTHubDeviceClient, Message, X509
-from azure.iot.device.models import RegistrationResult
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
@@ -44,7 +43,7 @@ class CertUser(User):
         logger.info("Starting CertUser")
         self.issued_cert_data: str = ""
         self.private_key: Optional[EllipticCurvePrivateKey] = None
-        self.registration_result: Optional[RegistrationResult] = None
+        self.registration_result: Optional[Any] = None
         self.device_client: Optional[IoTHubDeviceClient] = None
         self.is_connected: bool = False
         self.cert_file: Optional[str] = None
