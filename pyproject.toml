@@ -8,7 +8,8 @@ dependencies = [
     "azure-identity==1.23.0",
     "azure-iot-device",
     "cryptography>=46.0.3",
-    "locust>=2.32.4",
+    "locust>=2.42.5",
+    "orjson>=3.11.4",
 ]
 
 [dependency-groups]
