@@ -442,7 +442,7 @@ class CertUser(User):
                 total_time = int((time.time() - start_time) * 1000)
                 logger.info(f"Device connected to IoT Hub: {self.registration_result.registration_state.assigned_hub}")
                 self.environment.events.request.fire(
-                    request_type="IoTHub",
+                    request_type="Hub",
                     name="connect",
                     response_time=total_time,
                     response_length=0,
