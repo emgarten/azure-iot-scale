@@ -13,29 +13,79 @@ storage_container_name = os.getenv("STORAGE_CONTAINER_NAME", "scale")
 counter_blob_prefix = os.getenv("COUNTER_BLOB_PREFIX", "counter")
 device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
 
+# Global BlobServiceClient singleton
+_blob_service_client: Optional[BlobServiceClient] = None
+
 
 def get_blob_service_client() -> BlobServiceClient:
-    if storage_conn_str is None:
-        # Use default Azure credentials (managed identity, Azure CLI, etc.)
-        storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
-        if storage_account_url is None:
-            raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
-        credential = DefaultAzureCredential()
-        return BlobServiceClient(account_url=storage_account_url, credential=credential)
-    return BlobServiceClient.from_connection_string(storage_conn_str)
+    """Get or create the global BlobServiceClient singleton.
+
+    Returns:
+        BlobServiceClient: The global blob service client instance.
+    """
+    global _blob_service_client
+
+    if _blob_service_client is None:
+        if storage_conn_str is None:
+            # Use default Azure credentials (managed identity, Azure CLI, etc.)
+            storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
+            if storage_account_url is None:
+                raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
+            credential = DefaultAzureCredential()
+            _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
+        else:
+            _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
+
+    return _blob_service_client
 
 
-def save_device_data(device_name: str, data_dict: dict[str, Any]) -> None:
+def initialize_storage(blob_service_client: Optional[BlobServiceClient] = None) -> BlobServiceClient:
+    """Initialize storage by creating containers if they don't exist.
+
+    This should be called once at application startup to ensure all required
+    containers are available.
+
+    Args:
+        blob_service_client: Optional blob service client to use. If None, uses global singleton.
+
+    Returns:
+        BlobServiceClient: The blob service client that was initialized.
+    """
+    if blob_service_client is None:
+        blob_service_client = get_blob_service_client()
+
+    try:
+        # Create the main container if it doesn't exist
+        container_client = blob_service_client.get_container_client(storage_container_name)
+        container_client.create_container()
+        logger.info(f"Created storage container: {storage_container_name}")
+    except Exception as e:
+        # Container might already exist, which is fine
+        if "ContainerAlreadyExists" in str(e) or "The specified container already exists" in str(e):
+            logger.debug(f"Storage container already exists: {storage_container_name}")
+        else:
+            logger.warning(f"Error creating storage container {storage_container_name}: {e}")
+
+    return blob_service_client
+
+
+def save_device_data(
+    device_name: str,
+    data_dict: dict[str, Any],
+    blob_service_client: Optional[BlobServiceClient] = None,
+) -> None:
     """Save device data to Azure Blob Storage.
 
     Args:
         device_name: Name of the device
         data_dict: Dictionary containing device data to save
+        blob_service_client: Optional blob service client to use. If None, uses global singleton.
 
     The data is saved as JSON and will overwrite any existing data for this device.
     """
     try:
-        blob_service_client = get_blob_service_client()
+        if blob_service_client is None:
+            blob_service_client = get_blob_service_client()
         container_client = blob_service_client.get_container_client(storage_container_name)
         blob_name = f"{device_data_blob_prefix}/{device_name}/registration.json"
         blob_client = container_client.get_blob_client(blob_name)
@@ -51,11 +101,15 @@ def save_device_data(device_name: str, data_dict: dict[str, Any]) -> None:
         # Don't raise - graceful degradation
 
 
-def load_device_data(device_name: str) -> Optional[dict[str, Any]]:
+def load_device_data(
+    device_name: str,
+    blob_service_client: Optional[BlobServiceClient] = None,
+) -> Optional[dict[str, Any]]:
     """Load device data from Azure Blob Storage.
 
     Args:
         device_name: Name of the device
+        blob_service_client: Optional blob service client to use. If None, uses global singleton.
 
     Returns:
         Dictionary containing device data if found and valid, None otherwise.
@@ -74,7 +128,8 @@ def load_device_data(device_name: str) -> Optional[dict[str, Any]]:
     ]
 
     try:
-        blob_service_client = get_blob_service_client()
+        if blob_service_client is None:
+            blob_service_client = get_blob_service_client()
         container_client = blob_service_client.get_container_client(storage_container_name)
         blob_name = f"{device_data_blob_prefix}/{device_name}/registration.json"
         blob_client = container_client.get_blob_client(blob_name)
@@ -102,14 +157,19 @@ def load_device_data(device_name: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def delete_device_data(device_name: str) -> None:
+def delete_device_data(
+    device_name: str,
+    blob_service_client: Optional[BlobServiceClient] = None,
+) -> None:
     """Delete device data from Azure Blob Storage.
 
     Args:
         device_name: Name of the device
+        blob_service_client: Optional blob service client to use. If None, uses global singleton.
     """
     try:
-        blob_service_client = get_blob_service_client()
+        if blob_service_client is None:
+            blob_service_client = get_blob_service_client()
         container_client = blob_service_client.get_container_client(storage_container_name)
         blob_name = f"{device_data_blob_prefix}/{device_name}/registration.json"
         blob_client = container_client.get_blob_client(blob_name)

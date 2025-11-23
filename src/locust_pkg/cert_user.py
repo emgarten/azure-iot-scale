@@ -4,7 +4,6 @@ import hmac
 import os
 import tempfile
 import time
-import uuid
 from datetime import datetime, timezone
 from locust import User, task, constant_pacing
 import logging
@@ -18,10 +17,120 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 
-from utils import x509_certificate_list_to_pem, retry_with_backoff
-from storage import save_device_data, load_device_data
+from utils import x509_certificate_list_to_pem, retry_with_backoff, create_msg
+from storage import (
+    save_device_data as _save_device_data,
+    load_device_data as _load_device_data,
+    initialize_storage,
+)
 
 logger = logging.getLogger("locust.cert_user")
+
+
+def save_device_data(
+    device_name: str,
+    data_dict: dict[str, Any],
+    environment: Any,
+) -> None:
+    """Save device data to Azure Blob Storage with locust event tracking.
+
+    Args:
+        device_name: Name of the device
+        data_dict: Dictionary containing device data to save
+        environment: Locust environment for event firing
+    """
+    start_time = time.time()
+    json_data_size = len(str(data_dict))  # Approximate size
+
+    try:
+        _save_device_data(device_name, data_dict)
+
+        # Fire success event
+        total_time = int((time.time() - start_time) * 1000)
+        environment.events.request.fire(
+            request_type="Storage",
+            name="save_device_data",
+            response_time=total_time,
+            response_length=json_data_size,
+            exception=None,
+            context={"device_name": device_name, "status": "success"},
+        )
+    except Exception as e:
+        logger.error(f"Failed to save device data for {device_name}: {e}")
+
+        # Fire failure event
+        total_time = int((time.time() - start_time) * 1000)
+        environment.events.request.fire(
+            request_type="Storage",
+            name="save_device_data",
+            response_time=total_time,
+            response_length=json_data_size,
+            exception=str(e),
+            context={"device_name": device_name, "status": "error"},
+        )
+        # Don't raise - graceful degradation
+
+
+def load_device_data(
+    device_name: str,
+    environment: Any,
+) -> Optional[dict[str, Any]]:
+    """Load device data from Azure Blob Storage with locust event tracking.
+
+    Args:
+        device_name: Name of the device
+        environment: Locust environment for event firing
+
+    Returns:
+        Dictionary containing device data if found and valid, None otherwise.
+    """
+    start_time = time.time()
+    blob_data_size = 0
+
+    try:
+        result: Optional[dict[str, Any]] = _load_device_data(device_name)
+
+        if result is None:
+            # Fire event for blob not found (not an error, but tracked)
+            total_time = int((time.time() - start_time) * 1000)
+            environment.events.request.fire(
+                request_type="Storage",
+                name="load_device_data",
+                response_time=total_time,
+                response_length=0,
+                exception=None,
+                context={"device_name": device_name, "status": "not_found"},
+            )
+        else:
+            blob_data_size = len(str(result))  # Approximate size
+            # Fire success event
+            total_time = int((time.time() - start_time) * 1000)
+            environment.events.request.fire(
+                request_type="Storage",
+                name="load_device_data",
+                response_time=total_time,
+                response_length=blob_data_size,
+                exception=None,
+                context={"device_name": device_name, "status": "success"},
+            )
+
+        return result
+
+    except Exception as e:
+        logger.warning(f"Failed to load device data for {device_name}: {e}")
+
+        # Fire failure event
+        total_time = int((time.time() - start_time) * 1000)
+        environment.events.request.fire(
+            request_type="Storage",
+            name="load_device_data",
+            response_time=total_time,
+            response_length=blob_data_size,
+            exception=str(e),
+            context={"device_name": device_name, "status": "error"},
+        )
+        return None
+
 
 provisioning_host = os.getenv("PROVISIONING_HOST")
 id_scope = os.getenv("PROVISIONING_IDSCOPE")
@@ -29,11 +138,13 @@ dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
 
 hub_message_interval = int(os.getenv("HUB_MESSAGE_INTERVAL", "5"))  # seconds
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
+hub_message_size = int(os.getenv("HUB_MESSAGE_SIZE", "256"))  # bytes
 
 
 class CertUser(User):
     wait_time = constant_pacing(hub_message_interval)  # type: ignore[no-untyped-call]  # Time between tasks execution
     _device_counter: int = 0  # Class-level counter for unique device numbering
+    _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
 
     @classmethod
     def get_device_name(cls) -> str:
@@ -44,6 +155,13 @@ class CertUser(User):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+
+        # Initialize storage once globally (similar to device counter pattern)
+        if not CertUser._storage_initialized:
+            logger.info("Initializing storage (one-time setup)")
+            initialize_storage()
+            CertUser._storage_initialized = True
+
         self.device_name = self.get_device_name()
         logger.info(f"Starting CertUser: {self.device_name}")
         self.issued_cert_data: str = ""
@@ -55,7 +173,7 @@ class CertUser(User):
         self.key_file: Optional[str] = None
 
         # Check if a registration result already exists in device data storage
-        device_data = load_device_data(self.device_name)
+        device_data = load_device_data(self.device_name, self.environment)
 
         if device_data is not None:
             # Restore device state from storage
@@ -216,7 +334,7 @@ class CertUser(User):
                         "issued_cert_pem": self.issued_cert_data,
                         "registration_timestamp": datetime.now(tz=timezone.utc).isoformat(),
                     }
-                    save_device_data(self.device_name, device_data)
+                    save_device_data(self.device_name, device_data, self.environment)
 
         except Exception as e:
             # Log as a locust error
@@ -246,7 +364,7 @@ class CertUser(User):
         """Inner hub connection logic to be wrapped with retry."""
         # Load registration data from storage if not already in memory
         if self.registration_result is None or self.private_key is None or not self.issued_cert_data:
-            device_data = load_device_data(self.device_name)
+            device_data = load_device_data(self.device_name, self.environment)
             if device_data is not None:
                 logger.info("Loading device data from storage for connection")
 
@@ -379,39 +497,38 @@ class CertUser(User):
             return
 
         start_time = time.time()
-        message_id = str(uuid.uuid4())
 
         try:
             # Create and send message
-            msg = Message(f"test wind speed {time.time()}")  # type: ignore[no-untyped-call]
-            msg.message_id = message_id
+            message_data = create_msg(hub_message_size)
+            msg = Message(message_data)  # type: ignore[no-untyped-call]
 
             # Send message (synchronous for gevent compatibility)
             self.device_client.send_message(msg)
 
             # Log success
             total_time = int((time.time() - start_time) * 1000)
-            logger.debug(f"Message {message_id} sent successfully")
+            logger.debug("Message sent successfully")
             self.environment.events.request.fire(
                 request_type="Hub",
                 name="send_message",
                 response_time=total_time,
                 response_length=len(msg.data),
                 exception=None,
-                context={"message_id": message_id, "status": "sent"},
+                context={"status": "sent"},
             )
 
         except Exception as e:
             # Log as a locust error
             total_time = int((time.time() - start_time) * 1000)
-            logger.error(f"Failed to send message {message_id}: {str(e)}")
+            logger.error(f"Failed to send message: {str(e)}")
             self.environment.events.request.fire(
                 request_type="Hub",
                 name="send_message",
                 response_time=total_time,
                 response_length=0,
                 exception=str(e),
-                context={"message_id": message_id, "status": "error"},
+                context={"status": "error"},
             )
 
     def on_stop(self) -> None:
