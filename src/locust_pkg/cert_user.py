@@ -1,12 +1,12 @@
 import base64
 import hashlib
 import hmac
-import logging
 import os
 import tempfile
 import time
 import uuid
-from locust import User, task, between
+from locust import User, task, constant_pacing
+import logging
 from typing import Any, Optional
 
 from azure.iot.device import ProvisioningDeviceClient, IoTHubDeviceClient, Message, X509
@@ -17,30 +17,33 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+from locust_pkg.utils import x509_certificate_list_to_pem
 
-messages_to_send = 10
+logger = logging.getLogger("locust.cert_user")
+
 provisioning_host = os.getenv("PROVISIONING_HOST")
 id_scope = os.getenv("PROVISIONING_IDSCOPE")
-registration_id = os.getenv("PROVISIONING_REGISTRATION_ID")
-
 dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
 
-
-def x509_certificate_list_to_pem(cert_list: list[str]) -> str:
-    begin_cert_header = "-----BEGIN CERTIFICATE-----\r\n"
-    end_cert_footer = "\r\n-----END CERTIFICATE-----"
-    separator = end_cert_footer + "\r\n" + begin_cert_header
-    return begin_cert_header + separator.join(cert_list) + end_cert_footer
+hub_message_interval = int(os.getenv("HUB_MESSAGE_INTERVAL", "5"))  # seconds
+device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
 
 
 class CertUser(User):
-    wait_time = between(5, 10)  # type: ignore[no-untyped-call]  # Time between tasks execution
+    wait_time = constant_pacing(hub_message_interval)  # type: ignore[no-untyped-call]  # Time between tasks execution
+    _device_counter: int = 0  # Class-level counter for unique device numbering
+
+    @classmethod
+    def get_device_name(cls) -> str:
+        """Generate a unique device name using the prefix and an incrementing counter."""
+        device_name = f"{device_name_prefix}{cls._device_counter}"
+        cls._device_counter += 1
+        return device_name
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         logger.info("Starting CertUser")
+        self.device_name = self.get_device_name()
         self.issued_cert_data: str = ""
         self.private_key: Optional[EllipticCurvePrivateKey] = None
         self.registration_result: Optional[Any] = None
@@ -64,22 +67,20 @@ class CertUser(User):
         try:
             device_key: str = ""
 
-            # Handle optional dps_sas_key and registration_id
-            if dps_sas_key is not None and registration_id is not None:
+            # Handle optional dps_sas_key
+            if dps_sas_key is not None:
                 key_bytes = base64.b64decode(dps_sas_key)
-                derived_key = hmac.new(key_bytes, registration_id.encode("utf-8"), hashlib.sha256).digest()
+                derived_key = hmac.new(key_bytes, self.device_name.encode("utf-8"), hashlib.sha256).digest()
                 device_key = base64.b64encode(derived_key).decode("utf-8")
 
             if device_key is not None:
                 print("Using symmetric-key authentication")
                 # Validate required environment variables
-                if provisioning_host is None or registration_id is None or id_scope is None:
-                    raise Exception(
-                        "Missing required environment variables: PROVISIONING_HOST, PROVISIONING_IDSCOPE, or PROVISIONING_REGISTRATION_ID"
-                    )
+                if provisioning_host is None or id_scope is None:
+                    raise Exception("Missing required environment variables: PROVISIONING_HOST or PROVISIONING_IDSCOPE")
                 provisioning_device_client = ProvisioningDeviceClient.create_from_symmetric_key(
                     provisioning_host=provisioning_host,
-                    registration_id=registration_id,
+                    registration_id=self.device_name,
                     id_scope=id_scope,
                     symmetric_key=device_key,
                 )
@@ -93,13 +94,10 @@ class CertUser(User):
             self.private_key = ec.generate_private_key(ec.SECP256R1())
 
             # Generate CSR (Certificate Signing Request)
-            # Equivalent to: openssl req -new -key $key -subj "/CN=$registration_id" -outform DER | openssl base64 -A
-            if registration_id is None:
-                raise Exception("PROVISIONING_REGISTRATION_ID is required")
-
+            # Equivalent to: openssl req -new -key $key -subj "/CN=$device_name" -outform DER | openssl base64 -A
             csr_builder = x509.CertificateSigningRequestBuilder()
             csr_builder = csr_builder.subject_name(
-                x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, registration_id)])
+                x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.device_name)])
             )
 
             # Sign the CSR with the private key
@@ -130,7 +128,7 @@ class CertUser(User):
                     response_time=total_time,
                     response_length=0,
                     exception=error_msg,
-                    context={"registration_id": registration_id, "status": "error"},
+                    context={"registration_id": self.device_name, "status": "error"},
                 )
                 return
 
@@ -142,14 +140,14 @@ class CertUser(User):
 
             # Log success
             total_time = int((time.time() - start_time) * 1000)
-            logger.debug(f"Device {registration_id} provisioned successfully")
+            logger.debug(f"Device {self.device_name} provisioned successfully")
             self.environment.events.request.fire(
                 request_type="DPS_CSR",
                 name="device_provision",
                 response_time=total_time,
                 response_length=0,
                 exception=None,
-                context={"registration_id": registration_id, "status": self.registration_result.status},
+                context={"registration_id": self.device_name, "status": self.registration_result.status},
             )
 
             if self.registration_result.status == "assigned":
@@ -158,14 +156,14 @@ class CertUser(User):
         except Exception as e:
             # Log as a locust error
             total_time = int((time.time() - start_time) * 1000)
-            logger.error(f"Device {registration_id} provisioning failed: {str(e)}")
+            logger.error(f"Device {self.device_name} provisioning failed: {str(e)}")
             self.environment.events.request.fire(
                 request_type="DPS_CSR",
                 name="device_provision",
                 response_time=total_time,
                 response_length=0,
                 exception=str(e),
-                context={"registration_id": registration_id, "status": "error"},
+                context={"registration_id": self.device_name, "status": "error"},
             )
 
     def connect_hub(self) -> None:
