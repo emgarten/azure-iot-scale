@@ -5,9 +5,10 @@ import os
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from locust import User, task, constant_pacing
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from azure.iot.device import ProvisioningDeviceClient, IoTHubDeviceClient, Message, X509
 from cryptography.hazmat.primitives import serialization
@@ -17,7 +18,8 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 
-from locust_pkg.utils import x509_certificate_list_to_pem
+from locust_pkg.utils import x509_certificate_list_to_pem, retry_with_backoff
+from locust_pkg.storage import save_device_data, load_device_data
 
 logger = logging.getLogger("locust.cert_user")
 
@@ -51,19 +53,61 @@ class CertUser(User):
         self.is_connected: bool = False
         self.cert_file: Optional[str] = None
         self.key_file: Optional[str] = None
-        
-        # TODO: Check if a registration result already exists in device data storage for this device. If so use that and skip the registration, go right to connect_hub if assigned.
 
-        # TODO: Return the registration result from provision_device. Run in a loop trying endlessly until success. Report a locust metric on non-success. Wait 60s between attempts with a jitter of up to 30s.
-        # Provision with DPS
+        # Check if a registration result already exists in device data storage
+        device_data = load_device_data(self.device_name)
+
+        if device_data is not None:
+            # Restore device state from storage
+            logger.info(f"Loaded existing registration for {self.device_name}")
+            try:
+                # Reconstruct registration result (simplified object)
+                class RegistrationState:
+                    def __init__(self, assigned_hub: str, device_id: str):
+                        self.assigned_hub = assigned_hub
+                        self.device_id = device_id
+                        self.issued_client_certificate = None
+
+                class RegistrationResult:
+                    def __init__(self, status: str, registration_state: RegistrationState):
+                        self.status = status
+                        self.registration_state = registration_state
+
+                reg_state = RegistrationState(
+                    assigned_hub=device_data["assigned_hub"], device_id=device_data["device_id"]
+                )
+                self.registration_result = RegistrationResult(
+                    status=device_data["registration_status"], registration_state=reg_state
+                )
+
+                # Deserialize private key from PEM
+                loaded_key = serialization.load_pem_private_key(
+                    device_data["private_key_pem"].encode("utf-8"), password=None
+                )
+                # Type assertion - we know this is an EC key
+                self.private_key = cast(EllipticCurvePrivateKey, loaded_key)
+
+                # Load certificate
+                self.issued_cert_data = device_data["issued_cert_pem"]
+
+                # If assigned, skip provisioning and go straight to connect
+                if device_data["registration_status"] == "assigned":
+                    logger.info(f"Using existing registration for {self.device_name}, skipping provisioning")
+                    self.connect_hub()
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to restore device state from storage: {e}, will re-provision")
+                # Fall through to provisioning
+
+        # Provision with DPS (with retry logic)
         self.provision_device()
 
         # Connect to IoT Hub if provisioning succeeded
         if self.registration_result is not None and self.registration_result.status == "assigned":
             self.connect_hub()
 
-    # Provision a device with DPS
-    def provision_device(self) -> None:
+    def _provision_device_inner(self) -> None:
+        """Inner provisioning logic to be wrapped with retry."""
         # Set start time, but override it later for the relevant time.
         start_time = time.time()
 
@@ -94,7 +138,6 @@ class CertUser(User):
 
             # Generate EC private key (prime256v1 = SECP256R1)
             # Equivalent to: openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt
-            # TODO: Write the private key to storage under the device data blob prefix for later retrieval
             self.private_key = ec.generate_private_key(ec.SECP256R1())
 
             # Generate CSR (Certificate Signing Request)
@@ -155,8 +198,25 @@ class CertUser(User):
             )
 
             if self.registration_result.status == "assigned":
-                # TODO: Write the registration result to device data storage.
-                logger.info("Registration assigned")
+                # Save the registration result to device data storage
+                logger.info("Registration assigned, saving to storage")
+                if self.private_key is not None:
+                    private_key_pem = self.private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    ).decode("utf-8")
+
+                    device_data = {
+                        "device_name": self.device_name,
+                        "registration_status": self.registration_result.status,
+                        "assigned_hub": self.registration_result.registration_state.assigned_hub,
+                        "device_id": self.registration_result.registration_state.device_id,
+                        "private_key_pem": private_key_pem,
+                        "issued_cert_pem": self.issued_cert_data,
+                        "registration_timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    }
+                    save_device_data(self.device_name, device_data)
 
         except Exception as e:
             # Log as a locust error
@@ -170,25 +230,65 @@ class CertUser(User):
                 exception=str(e),
                 context={"registration_id": self.device_name, "status": "error"},
             )
+            # Re-raise to trigger retry
+            raise
 
-    def connect_hub(self) -> None:
-        """Connect to IoT Hub using X.509 certificate from provisioning."""
-        
-        # TODO: Read the registration result from device data storage if not already in memory.
-        
+    def provision_device(self) -> None:
+        """Provision a device with DPS using retry logic."""
+        retry_with_backoff(
+            operation_name=f"provision_device({self.device_name})",
+            operation_func=self._provision_device_inner,
+            base_wait=60,
+            max_jitter=30,
+        )
+
+    def _connect_hub_inner(self) -> None:
+        """Inner hub connection logic to be wrapped with retry."""
+        # Load registration data from storage if not already in memory
+        if self.registration_result is None or self.private_key is None or not self.issued_cert_data:
+            device_data = load_device_data(self.device_name)
+            if device_data is not None:
+                logger.info("Loading device data from storage for connection")
+
+                # Reconstruct registration result
+                class RegistrationState:
+                    def __init__(self, assigned_hub: str, device_id: str):
+                        self.assigned_hub = assigned_hub
+                        self.device_id = device_id
+                        self.issued_client_certificate = None
+
+                class RegistrationResult:
+                    def __init__(self, status: str, registration_state: RegistrationState):
+                        self.status = status
+                        self.registration_state = registration_state
+
+                reg_state = RegistrationState(
+                    assigned_hub=device_data["assigned_hub"], device_id=device_data["device_id"]
+                )
+                self.registration_result = RegistrationResult(
+                    status=device_data["registration_status"], registration_state=reg_state
+                )
+
+                # Deserialize private key from PEM
+                loaded_key = serialization.load_pem_private_key(
+                    device_data["private_key_pem"].encode("utf-8"), password=None
+                )
+                # Type assertion - we know this is an EC key
+                self.private_key = cast(EllipticCurvePrivateKey, loaded_key)
+
+                # Load certificate
+                self.issued_cert_data = device_data["issued_cert_pem"]
+
         if self.registration_result is None or self.registration_result.registration_state is None:
-            logger.error("Cannot connect to hub: no registration result")
-            return
+            raise Exception("Cannot connect to hub: no registration result")
 
         if self.private_key is None:
-            logger.error("Cannot connect to hub: no private key")
-            return
+            raise Exception("Cannot connect to hub: no private key")
 
         start_time = time.time()
 
         try:
             # Serialize the private key to PEM format
-            # TODO: Read this private key from device data storage.
             private_key_pem = self.private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
@@ -258,6 +358,17 @@ class CertUser(User):
                 context={"status": "error"},
             )
             self.is_connected = False
+            # Re-raise to trigger retry
+            raise
+
+    def connect_hub(self) -> None:
+        """Connect to IoT Hub using X.509 certificate from provisioning with retry logic."""
+        retry_with_backoff(
+            operation_name=f"connect_hub({self.device_name})",
+            operation_func=self._connect_hub_inner,
+            base_wait=60,
+            max_jitter=30,
+        )
 
     @task
     def send_message(self) -> None:
