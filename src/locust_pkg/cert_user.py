@@ -42,8 +42,8 @@ class CertUser(User):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        logger.info("Starting CertUser")
         self.device_name = self.get_device_name()
+        logger.info(f"Starting CertUser: {self.device_name}")
         self.issued_cert_data: str = ""
         self.private_key: Optional[EllipticCurvePrivateKey] = None
         self.registration_result: Optional[Any] = None
@@ -51,7 +51,10 @@ class CertUser(User):
         self.is_connected: bool = False
         self.cert_file: Optional[str] = None
         self.key_file: Optional[str] = None
+        
+        # TODO: Check if a registration result already exists in device data storage for this device. If so use that and skip the registration, go right to connect_hub if assigned.
 
+        # TODO: Return the registration result from provision_device. Run in a loop trying endlessly until success. Report a locust metric on non-success. Wait 60s between attempts with a jitter of up to 30s.
         # Provision with DPS
         self.provision_device()
 
@@ -91,6 +94,7 @@ class CertUser(User):
 
             # Generate EC private key (prime256v1 = SECP256R1)
             # Equivalent to: openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt
+            # TODO: Write the private key to storage under the device data blob prefix for later retrieval
             self.private_key = ec.generate_private_key(ec.SECP256R1())
 
             # Generate CSR (Certificate Signing Request)
@@ -151,6 +155,7 @@ class CertUser(User):
             )
 
             if self.registration_result.status == "assigned":
+                # TODO: Write the registration result to device data storage.
                 logger.info("Registration assigned")
 
         except Exception as e:
@@ -168,6 +173,9 @@ class CertUser(User):
 
     def connect_hub(self) -> None:
         """Connect to IoT Hub using X.509 certificate from provisioning."""
+        
+        # TODO: Read the registration result from device data storage if not already in memory.
+        
         if self.registration_result is None or self.registration_result.registration_state is None:
             logger.error("Cannot connect to hub: no registration result")
             return
@@ -180,6 +188,7 @@ class CertUser(User):
 
         try:
             # Serialize the private key to PEM format
+            # TODO: Read this private key from device data storage.
             private_key_pem = self.private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
