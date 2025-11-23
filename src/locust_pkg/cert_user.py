@@ -18,8 +18,8 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 
-from locust_pkg.utils import x509_certificate_list_to_pem, retry_with_backoff
-from locust_pkg.storage import save_device_data, load_device_data
+from utils import x509_certificate_list_to_pem, retry_with_backoff
+from storage import save_device_data, load_device_data
 
 logger = logging.getLogger("locust.cert_user")
 
@@ -170,7 +170,7 @@ class CertUser(User):
                 error_msg = "Registration failed: no registration state returned"
                 logger.debug(error_msg)
                 self.environment.events.request.fire(
-                    request_type="DPS_CSR",
+                    request_type="DPS",
                     name="device_provision",
                     response_time=total_time,
                     response_length=0,
@@ -189,7 +189,7 @@ class CertUser(User):
             total_time = int((time.time() - start_time) * 1000)
             logger.debug(f"Device {self.device_name} provisioned successfully")
             self.environment.events.request.fire(
-                request_type="DPS_CSR",
+                request_type="DPS",
                 name="device_provision",
                 response_time=total_time,
                 response_length=0,
@@ -223,7 +223,7 @@ class CertUser(User):
             total_time = int((time.time() - start_time) * 1000)
             logger.error(f"Device {self.device_name} provisioning failed: {str(e)}")
             self.environment.events.request.fire(
-                request_type="DPS_CSR",
+                request_type="DPS",
                 name="device_provision",
                 response_time=total_time,
                 response_length=0,
@@ -350,7 +350,7 @@ class CertUser(User):
             total_time = int((time.time() - start_time) * 1000)
             logger.error(f"Failed to connect to IoT Hub: {str(e)}")
             self.environment.events.request.fire(
-                request_type="IoTHub",
+                request_type="Hub",
                 name="connect",
                 response_time=total_time,
                 response_length=0,
@@ -393,7 +393,7 @@ class CertUser(User):
             total_time = int((time.time() - start_time) * 1000)
             logger.debug(f"Message {message_id} sent successfully")
             self.environment.events.request.fire(
-                request_type="IoTHub",
+                request_type="Hub",
                 name="send_message",
                 response_time=total_time,
                 response_length=len(msg.data),
@@ -406,7 +406,7 @@ class CertUser(User):
             total_time = int((time.time() - start_time) * 1000)
             logger.error(f"Failed to send message {message_id}: {str(e)}")
             self.environment.events.request.fire(
-                request_type="IoTHub",
+                request_type="Hub",
                 name="send_message",
                 response_time=total_time,
                 response_length=0,
