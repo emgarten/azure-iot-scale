@@ -66,7 +66,7 @@ wheels = [
 [[package]]
 name = "azure-iot-device"
 version = "2.14.0"
-source = { path = "wheels/azure_iot_device-2.14.0.tar.gz" }
+source = { path = "wheels/azure_iot_device-2.14.0-py3-none-any.whl" }
 dependencies = [
     { name = "deprecation" },
     { name = "janus" },
@@ -77,7 +77,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "urllib3" },
 ]
-sdist = { hash = "sha256:e63f6cf3ccf4439e6f94e786f33e921308569a59219eaf3505a327ed765d1f95" }
+wheels = [
+    { filename = "azure_iot_device-2.14.0-py3-none-any.whl", hash = "sha256:d5e37b667eb535c088358cac8f1d4c3042b16fd4cc17c307e373f36ca7c57d4c" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -134,7 +136,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "azure-identity", specifier = "==1.23.0" },
-    { name = "azure-iot-device", path = "wheels/azure_iot_device-2.14.0.tar.gz" },
+    { name = "azure-iot-device", path = "wheels/azure_iot_device-2.14.0-py3-none-any.whl" },
     { name = "azure-storage-blob", specifier = ">=12.27.1" },
     { name = "cryptography", specifier = ">=46.0.3" },
     { name = "locust", specifier = ">=2.42.5" },
