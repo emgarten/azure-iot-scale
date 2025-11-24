@@ -9,16 +9,29 @@ from locust import User, task, constant_pacing
 import logging
 from typing import Any, Optional, cast
 
-from azure.iot.device import ProvisioningDeviceClient, IoTHubDeviceClient, Message, X509
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
-from cryptography import x509
-from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes
+import sys
+import zipfile
+from pathlib import Path
 
-from utils import x509_certificate_list_to_pem, retry_with_backoff, create_msg
-from storage import (
+wheel_path = Path("azure_iot_device-2.14.0-py3-none-any.whl")
+if wheel_path.exists():
+    print(f"Wheel file found at: {wheel_path.resolve()}")
+    extract_dir = Path(tempfile.mkdtemp(prefix="wheel_"))
+    with zipfile.ZipFile(wheel_path) as zf:
+        zf.extractall(extract_dir)
+    # The package top-level is typically a directory next to *.dist-info inside the wheel
+    sys.path.insert(0, str(extract_dir))
+
+# azure.iot.device imports are deferred to inside methods to ensure wheel is loaded first
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey  # noqa: E402
+from cryptography import x509  # noqa: E402
+from cryptography.x509.oid import NameOID  # noqa: E402
+from cryptography.hazmat.primitives import hashes  # noqa: E402
+
+from utils import x509_certificate_list_to_pem, retry_with_backoff, create_msg  # noqa: E402
+from storage import (  # noqa: E402
     save_device_data as _save_device_data,
     load_device_data as _load_device_data,
     initialize_storage,
@@ -167,7 +180,7 @@ class CertUser(User):
         self.issued_cert_data: str = ""
         self.private_key: Optional[EllipticCurvePrivateKey] = None
         self.registration_result: Optional[Any] = None
-        self.device_client: Optional[IoTHubDeviceClient] = None
+        self.device_client: Optional[Any] = None  # IoTHubDeviceClient loaded dynamically
         self.is_connected: bool = False
         self.cert_file: Optional[str] = None
         self.key_file: Optional[str] = None
@@ -226,6 +239,9 @@ class CertUser(User):
 
     def _provision_device_inner(self) -> None:
         """Inner provisioning logic to be wrapped with retry."""
+        # Import azure.iot.device after wheel is loaded
+        from azure.iot.device import ProvisioningDeviceClient
+
         # Set start time, but override it later for the relevant time.
         start_time = time.time()
 
@@ -362,6 +378,9 @@ class CertUser(User):
 
     def _connect_hub_inner(self) -> None:
         """Inner hub connection logic to be wrapped with retry."""
+        # Import azure.iot.device after wheel is loaded
+        from azure.iot.device import IoTHubDeviceClient, X509
+
         # Load registration data from storage if not already in memory
         if self.registration_result is None or self.private_key is None or not self.issued_cert_data:
             device_data = load_device_data(self.device_name, self.environment)
@@ -491,6 +510,9 @@ class CertUser(User):
     @task
     def send_message(self) -> None:
         """Send a single telemetry message to IoT Hub."""
+        # Import azure.iot.device after wheel is loaded
+        from azure.iot.device import Message
+
         # Ensure device is connected before sending
         if not self.is_connected or self.device_client is None:
             logger.warning("Device not connected, skipping message send")
