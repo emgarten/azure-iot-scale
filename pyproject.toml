@@ -7,7 +7,10 @@ requires-python = ">=3.12"
 dependencies = [
     "azure-identity==1.23.0",
     "azure-iot-device",
-    "locust>=2.32.4",
+    "azure-storage-blob>=12.27.1",
+    "cryptography>=46.0.3",
+    "locust>=2.42.5",
+    "orjson>=3.11.4",
 ]
 
 [dependency-groups]
@@ -51,4 +54,4 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.uv.sources]
-azure-iot-device = { path = "wheels/azure_iot_device-2.14.0.tar.gz" }
+azure-iot-device = { path = "wheels/azure_iot_device-2.14.0-py3-none-any.whl" }

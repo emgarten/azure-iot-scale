@@ -33,12 +33,17 @@ test: ## Test the code with pytest
 .PHONY: run
 run: ## Run locust load test
 	@echo "Running locust load test"
-	@uv run locust -f src/locust_pkg --headless --autostart --run-time 1m TestUser
+	@PYTHONPATH=src/locust_pkg uv run locust -f src/locust_pkg --headless --autostart --run-time 30s --loglevel DEBUG CertUser
 
 .PHONY: build
-build: clean-build ## Build wheel file
-	@echo "Creating wheel file"
-	@uvx --from build pyproject-build --installer uv
+build: clean-build ## Create requirements.txt file in /dist
+	@echo "Creating requirements.txt in /dist"
+	@mkdir -p dist
+	@uv export --no-dev --no-hashes -o dist/requirements.txt
+	@echo "Copying wheel files to /dist"
+	@cp wheels/* dist/ 2>/dev/null || true
+	@echo "Removing local package references from requirements.txt"
+	@sed -i '/^\.\/wheels\//d' dist/requirements.txt
 
 .PHONY: wheel
 wheel: ## Build wheel file using uv build
