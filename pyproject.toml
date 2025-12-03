@@ -11,6 +11,7 @@ dependencies = [
     "cryptography>=46.0.3",
     "locust>=2.42.5",
     "orjson>=3.11.4",
+    "paho-mqtt>=1.6.1,<2.0.0",
 ]
 
 [dependency-groups]

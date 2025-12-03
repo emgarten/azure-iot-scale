@@ -119,6 +119,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "locust" },
     { name = "orjson" },
+    { name = "paho-mqtt" },
 ]
 
 [package.dev-dependencies]
@@ -141,6 +142,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=46.0.3" },
     { name = "locust", specifier = ">=2.42.5" },
     { name = "orjson", specifier = ">=3.11.4" },
+    { name = "paho-mqtt", specifier = ">=1.6.1,<2.0.0" },
 ]
 
 [package.metadata.requires-dev]
