@@ -39,6 +39,14 @@ from storage import (  # noqa: E402
 
 logger = logging.getLogger("locust.cert_user")
 
+provisioning_host = os.getenv("PROVISIONING_HOST")
+id_scope = os.getenv("PROVISIONING_IDSCOPE")
+dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
+
+hub_message_interval = int(os.getenv("HUB_MESSAGE_INTERVAL", "5"))  # seconds
+device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
+hub_message_size = int(os.getenv("HUB_MESSAGE_SIZE", "256"))  # bytes
+
 
 def save_device_data(
     device_name: str,
@@ -143,15 +151,6 @@ def load_device_data(
             context={"device_name": device_name, "status": "error"},
         )
         return None
-
-
-provisioning_host = os.getenv("PROVISIONING_HOST")
-id_scope = os.getenv("PROVISIONING_IDSCOPE")
-dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
-
-hub_message_interval = int(os.getenv("HUB_MESSAGE_INTERVAL", "5"))  # seconds
-device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
-hub_message_size = int(os.getenv("HUB_MESSAGE_SIZE", "256"))  # bytes
 
 
 class CertUser(User):
