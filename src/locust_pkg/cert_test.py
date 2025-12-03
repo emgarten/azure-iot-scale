@@ -211,6 +211,66 @@ def provision_device(
     # Set restrictive permissions on key file
     os.chmod(key_path, 0o600)
 
+    # Save metadata to JSON file
+    metadata_path = os.path.join(output_dir, f"{device_name}.json")
+    metadata = {
+        "assigned_hub": assigned_hub,
+        "device_id": device_id,
+    }
+    print(f"Saving metadata to: {metadata_path}")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    return assigned_hub, device_id, cert_path, key_path, private_key
+
+
+def load_existing_credentials(
+    output_dir: str,
+    device_name: str,
+) -> tuple[str, str, str, str, ec.EllipticCurvePrivateKey] | None:
+    """Load existing credentials from disk if they exist.
+
+    Args:
+        output_dir: Directory containing credential files.
+        device_name: Device name used for file naming.
+
+    Returns:
+        Tuple of (assigned_hub, device_id, cert_path, key_path, private_key) if all files exist,
+        None otherwise.
+    """
+    cert_path = os.path.join(output_dir, f"{device_name}.cert.pem")
+    key_path = os.path.join(output_dir, f"{device_name}.key.pem")
+    metadata_path = os.path.join(output_dir, f"{device_name}.json")
+
+    # Check if all required files exist
+    if not os.path.exists(cert_path):
+        return None
+    if not os.path.exists(key_path):
+        return None
+    if not os.path.exists(metadata_path):
+        return None
+
+    print(f"Found existing credentials in {output_dir}")
+
+    # Load metadata
+    print(f"Loading metadata from: {metadata_path}")
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+
+    assigned_hub = metadata["assigned_hub"]
+    device_id = metadata["device_id"]
+
+    # Load private key
+    print(f"Loading private key from: {key_path}")
+    with open(key_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise RuntimeError("Private key is not an EC key")
+
+    print(f"Device ID: {device_id}")
+    print(f"Assigned hub: {assigned_hub}")
+
     return assigned_hub, device_id, cert_path, key_path, private_key
 
 
@@ -359,6 +419,21 @@ def request_new_certificate(
     # Wait a moment for subscription to be established
     time.sleep(0.5)
 
+    # Send a test message first to verify connectivity before CSR request
+    test_topic = f"devices/{device_id}/messages/events/"
+    test_payload = json.dumps({"type": "pre-csr-test", "device_id": device_id})
+    print("Sending test message to verify connectivity...")
+    test_result = client.publish(test_topic, payload=test_payload, qos=1)
+    if test_result.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(f"Failed to publish test message: {test_result.rc}")
+
+    print(f"Test message sent (mid: {test_result.mid})")
+    test_result.wait_for_publish(timeout=10)
+    if test_result.is_published():
+        print(f"Test message (mid: {test_result.mid}) confirmed delivered to broker - connectivity verified!")
+    else:
+        raise RuntimeError(f"Test message (mid: {test_result.mid}) delivery NOT confirmed - aborting CSR request")
+
     # Publish CSR request
     payload = json.dumps({"id": device_id, "csr": csr_data})
     print(f"Publishing CSR to: {publish_topic}")
@@ -370,21 +445,42 @@ def request_new_certificate(
 
     print(f"CSR request sent (mid: {result.mid})")
 
-    # Wait for response with progress updates
+    # Wait for publish acknowledgment from broker
+    result.wait_for_publish(timeout=10)
+    if result.is_published():
+        print(f"CSR request (mid: {result.mid}) confirmed delivered to broker")
+    else:
+        raise RuntimeError(f"CSR request (mid: {result.mid}) delivery NOT confirmed by broker")
+
+    # Wait for response with progress updates, sending keepalive messages every 5 seconds
     start_time = time.time()
-    last_progress = start_time
+    last_keepalive = start_time
+    keepalive_topic = f"devices/{device_id}/messages/events/"
+    keepalive_count = 0
 
     print(f"\nWaiting for credential response (timeout: {CREDENTIAL_RESPONSE_TIMEOUT}s)...")
+    print("Sending keepalive messages every 5 seconds...")
 
     while not response_received and _running:
         elapsed = time.time() - start_time
         if elapsed >= CREDENTIAL_RESPONSE_TIMEOUT:
             raise RuntimeError(f"Timeout waiting for credential response after {CREDENTIAL_RESPONSE_TIMEOUT} seconds")
 
-        # Print progress every 5 seconds
-        if time.time() - last_progress >= 5:
-            print(f"  ... waiting for response ({int(elapsed)}s elapsed)")
-            last_progress = time.time()
+        # Send keepalive message every 5 seconds
+        if time.time() - last_keepalive >= 5:
+            keepalive_count += 1
+            keepalive_payload = json.dumps({"type": "keepalive", "seq": keepalive_count})
+            keepalive_result = client.publish(keepalive_topic, payload=keepalive_payload, qos=1)
+            keepalive_result.wait_for_publish(timeout=5)
+            if keepalive_result.is_published():
+                print(
+                    f"  Keepalive {keepalive_count} sent and ack'd (mid: {keepalive_result.mid}, {int(elapsed)}s elapsed)"
+                )
+            else:
+                print(
+                    f"  Keepalive {keepalive_count} sent but NOT ack'd (mid: {keepalive_result.mid}, {int(elapsed)}s elapsed)"
+                )
+            last_keepalive = time.time()
 
         time.sleep(0.1)
 
@@ -418,6 +514,7 @@ def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
     """
     global _running
     message_count = 0
+    ack_count = 0
 
     # Telemetry topic for Azure IoT Hub
     telemetry_topic = f"devices/{device_id}/messages/events/"
@@ -430,7 +527,15 @@ def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
 
             result = client.publish(telemetry_topic, payload=message_data, qos=1)
             message_count += 1
-            print(f"Message {message_count} sent ({len(message_data)} bytes, mid: {result.mid})")
+            print(f"Message {message_count} sent ({len(message_data)} bytes, mid: {result.mid})", end="")
+
+            # Wait for publish acknowledgment from broker
+            result.wait_for_publish(timeout=10)
+            if result.is_published():
+                ack_count += 1
+                print(" - ack'd")
+            else:
+                print(" - NOT ack'd")
 
             # Sleep in small increments to allow faster Ctrl+C response
             for _ in range(MESSAGE_INTERVAL * 10):
@@ -444,7 +549,7 @@ def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
                 print("Retrying in 5 seconds...")
                 time.sleep(5)
 
-    print(f"\nTotal messages sent: {message_count}")
+    print(f"\nTotal messages sent: {message_count}, acknowledged: {ack_count}")
 
 
 def main() -> int:
@@ -458,14 +563,28 @@ def main() -> int:
     client: mqtt.Client | None = None
 
     try:
-        # Step 1: Provision device with DPS
-        assigned_hub, device_id, cert_path, key_path, private_key = provision_device(
-            provisioning_host=args.provisioning_host,
-            id_scope=args.id_scope,
-            sas_key=args.sas_key,
-            device_name=args.device_name,
+        # Step 1: Load existing credentials or provision device with DPS
+        print("=" * 70)
+        print("STEP 1: Loading credentials")
+        print("=" * 70)
+
+        existing_credentials = load_existing_credentials(
             output_dir=args.output_dir,
+            device_name=args.device_name,
         )
+
+        if existing_credentials is not None:
+            assigned_hub, device_id, cert_path, key_path, private_key = existing_credentials
+            print("Using existing credentials, skipping DPS provisioning")
+        else:
+            print("No existing credentials found, provisioning with DPS...")
+            assigned_hub, device_id, cert_path, key_path, private_key = provision_device(
+                provisioning_host=args.provisioning_host,
+                id_scope=args.id_scope,
+                sas_key=args.sas_key,
+                device_name=args.device_name,
+                output_dir=args.output_dir,
+            )
 
         # Step 2: Connect to IoT Hub with DPS-issued certificate using Paho MQTT
         print("\n" + "=" * 70)
