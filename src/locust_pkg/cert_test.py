@@ -34,14 +34,23 @@ MQTT_PORT = 8883
 API_VERSION = "2025-08-01-preview"
 CREDENTIAL_RESPONSE_TIMEOUT = 60 * 60 * 6  # seconds
 
-# Global flag for graceful shutdown
+# Global flags for graceful shutdown
 _running = True
+_shutdown_requested = False
 
 
 def signal_handler(signum: int, frame: object) -> None:
-    """Handle Ctrl+C for graceful shutdown."""
-    global _running
-    print("\nShutdown requested, finishing current operation...")
+    """Handle Ctrl+C for graceful shutdown.
+
+    First Ctrl+C: Request graceful shutdown.
+    Second Ctrl+C: Force immediate exit.
+    """
+    global _running, _shutdown_requested
+    if _shutdown_requested:
+        print("\nForced shutdown, exiting immediately...")
+        sys.exit(1)
+    print("\nShutdown requested, finishing current operation... (Ctrl+C again to force quit)")
+    _shutdown_requested = True
     _running = False
 
 
@@ -428,11 +437,6 @@ def request_new_certificate(
         raise RuntimeError(f"Failed to publish test message: {test_result.rc}")
 
     print(f"Test message sent (mid: {test_result.mid})")
-    test_result.wait_for_publish(timeout=10)
-    if test_result.is_published():
-        print(f"Test message (mid: {test_result.mid}) confirmed delivered to broker - connectivity verified!")
-    else:
-        raise RuntimeError(f"Test message (mid: {test_result.mid}) delivery NOT confirmed - aborting CSR request")
 
     # Publish CSR request
     payload = json.dumps({"id": device_id, "csr": csr_data})
@@ -444,13 +448,6 @@ def request_new_certificate(
         raise RuntimeError(f"Failed to publish CSR request: {result.rc}")
 
     print(f"CSR request sent (mid: {result.mid})")
-
-    # Wait for publish acknowledgment from broker
-    result.wait_for_publish(timeout=10)
-    if result.is_published():
-        print(f"CSR request (mid: {result.mid}) confirmed delivered to broker")
-    else:
-        raise RuntimeError(f"CSR request (mid: {result.mid}) delivery NOT confirmed by broker")
 
     # Wait for response with progress updates, sending keepalive messages every 5 seconds
     start_time = time.time()
@@ -471,15 +468,7 @@ def request_new_certificate(
             keepalive_count += 1
             keepalive_payload = json.dumps({"type": "keepalive", "seq": keepalive_count})
             keepalive_result = client.publish(keepalive_topic, payload=keepalive_payload, qos=1)
-            keepalive_result.wait_for_publish(timeout=5)
-            if keepalive_result.is_published():
-                print(
-                    f"  Keepalive {keepalive_count} sent and ack'd (mid: {keepalive_result.mid}, {int(elapsed)}s elapsed)"
-                )
-            else:
-                print(
-                    f"  Keepalive {keepalive_count} sent but NOT ack'd (mid: {keepalive_result.mid}, {int(elapsed)}s elapsed)"
-                )
+            print(f"  Keepalive {keepalive_count} sent (mid: {keepalive_result.mid}, {int(elapsed)}s elapsed)")
             last_keepalive = time.time()
 
         time.sleep(0.1)
@@ -514,7 +503,6 @@ def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
     """
     global _running
     message_count = 0
-    ack_count = 0
 
     # Telemetry topic for Azure IoT Hub
     telemetry_topic = f"devices/{device_id}/messages/events/"
@@ -527,15 +515,7 @@ def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
 
             result = client.publish(telemetry_topic, payload=message_data, qos=1)
             message_count += 1
-            print(f"Message {message_count} sent ({len(message_data)} bytes, mid: {result.mid})", end="")
-
-            # Wait for publish acknowledgment from broker
-            result.wait_for_publish(timeout=10)
-            if result.is_published():
-                ack_count += 1
-                print(" - ack'd")
-            else:
-                print(" - NOT ack'd")
+            print(f"Message {message_count} sent ({len(message_data)} bytes, mid: {result.mid})")
 
             # Sleep in small increments to allow faster Ctrl+C response
             for _ in range(MESSAGE_INTERVAL * 10):
@@ -549,7 +529,7 @@ def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
                 print("Retrying in 5 seconds...")
                 time.sleep(5)
 
-    print(f"\nTotal messages sent: {message_count}, acknowledged: {ack_count}")
+    print(f"\nTotal messages sent: {message_count}")
 
 
 def main() -> int:
