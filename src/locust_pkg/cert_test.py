@@ -17,6 +17,7 @@ import signal
 import ssl
 import sys
 import time
+import warnings
 from typing import Any
 
 import paho.mqtt.client as mqtt
@@ -71,7 +72,7 @@ def create_msg(size: int) -> bytes:
     return orjson.dumps({"date": now, "val": "A" * size})
 
 
-def create_csr(private_key: ec.EllipticCurvePrivateKey, device_name: str) -> str:
+def create_csr(private_key: ec.EllipticCurvePrivateKey, device_name: str) -> tuple[str, x509.CertificateSigningRequest]:
     """Create a CSR using an existing private key.
 
     Args:
@@ -79,7 +80,7 @@ def create_csr(private_key: ec.EllipticCurvePrivateKey, device_name: str) -> str
         device_name: The device name to use as the Common Name.
 
     Returns:
-        Base64-encoded DER format CSR string.
+        Tuple of (Base64-encoded DER format CSR string, CSR object).
     """
     csr_builder = x509.CertificateSigningRequestBuilder()
     csr_builder = csr_builder.subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, device_name)]))
@@ -87,7 +88,61 @@ def create_csr(private_key: ec.EllipticCurvePrivateKey, device_name: str) -> str
 
     # Convert CSR to DER format and then base64 encode it
     csr_der = csr.public_bytes(serialization.Encoding.DER)
-    return base64.b64encode(csr_der).decode("utf-8")
+    return base64.b64encode(csr_der).decode("utf-8"), csr
+
+
+def print_csr_details(csr: x509.CertificateSigningRequest) -> None:
+    """Print CSR subject/common name.
+
+    Args:
+        csr: The CSR object to display.
+    """
+    # Extract Common Name from subject
+    common_name = None
+    for attr in csr.subject:
+        if attr.oid == NameOID.COMMON_NAME:
+            common_name = attr.value
+            break
+
+    print(f"  Subject CN: {common_name or 'N/A'}")
+
+
+def print_certificate_chain(cert_pem_list: list[str]) -> None:
+    """Print certificate chain with subject CN and validity.
+
+    Args:
+        cert_pem_list: List of base64-encoded certificates.
+    """
+    from cryptography.utils import CryptographyDeprecationWarning
+
+    print(f"\n=== Certificate Chain ({len(cert_pem_list)} certificate(s)) ===")
+
+    for i, cert_b64 in enumerate(cert_pem_list):
+        try:
+            # Decode base64 and parse certificate
+            cert_der = base64.b64decode(cert_b64)
+            # Suppress warning for certificates with NULL parameter in signature algorithm
+            # (common with certain Java-generated certificates, see pyca/cryptography#8996)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+                cert = x509.load_der_x509_certificate(cert_der)
+
+            # Extract Common Name from subject
+            common_name = None
+            for attr in cert.subject:
+                if attr.oid == NameOID.COMMON_NAME:
+                    common_name = attr.value
+                    break
+
+            print(f"\n  Certificate [{i + 1}]:")
+            print(f"    Subject CN: {common_name or 'N/A'}")
+            print(f"    Not Before: {cert.not_valid_before_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"    Not After:  {cert.not_valid_after_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+        except Exception as e:
+            print(f"\n  Certificate [{i + 1}]: Failed to parse - {e}")
+
+    print()
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,7 +219,7 @@ def provision_device(
 
     # Generate CSR (Certificate Signing Request)
     print("Creating certificate signing request...")
-    csr_data = create_csr(private_key, device_name)
+    csr_data, _ = create_csr(private_key, device_name)
 
     # Set the CSR on the client
     provisioning_client.client_certificate_signing_request = csr_data
@@ -302,6 +357,10 @@ def connect_mqtt_with_cert(
     """
     print(f"Connecting to IoT Hub via MQTT: {hostname}...")
 
+    # Print full paths and credentials for debugging
+    print(f"  Certificate file: {os.path.abspath(cert_file)}")
+    print(f"  Key file: {os.path.abspath(key_file)}")
+
     # Create MQTT client (paho-mqtt 1.x API)
     client = mqtt.Client(
         client_id=device_id,
@@ -310,6 +369,7 @@ def connect_mqtt_with_cert(
 
     # Set username for Azure IoT Hub
     username = f"{hostname}/{device_id}/?api-version={API_VERSION}"
+    print(f"  Username: {username}")
     client.username_pw_set(username=username)
 
     # Configure TLS with system CA bundle and client certificate
@@ -372,8 +432,6 @@ def request_new_certificate(
         print(f"\n{'=' * 70}")
         print("CREDENTIAL RESPONSE RECEIVED!")
         print(f"{'=' * 70}")
-        print(f"Topic: {msg.topic}")
-        print(f"Payload length: {len(msg.payload)} bytes")
 
         # Extract status code from topic
         # Topic format: $iothub/credentials/res/202/?$rid=999888777&$version=1
@@ -383,21 +441,17 @@ def request_new_certificate(
             status_code = parts[3]
             print(f"Status Code: {status_code}")
 
+        # Show topic and pretty print payload
+        print(f"Topic: {msg.topic}")
         if msg.payload:
             try:
                 payload_str = msg.payload.decode("utf-8")
-                print(f"Payload: {payload_str}")
                 payload_data = json.loads(payload_str)
+                print(f"Payload:\n{json.dumps(payload_data, indent=2)}")
 
                 # Extract certificate from response
-                if "certificate" in payload_data:
-                    cert_data = payload_data["certificate"]
-                    if isinstance(cert_data, list):
-                        response_cert.extend(cert_data)
-                    elif isinstance(cert_data, str):
-                        response_cert.append(cert_data)
-                elif "cert" in payload_data:
-                    cert_data = payload_data["cert"]
+                if "certificates" in payload_data:
+                    cert_data = payload_data["certificates"]
                     if isinstance(cert_data, list):
                         response_cert.extend(cert_data)
                     elif isinstance(cert_data, str):
@@ -406,6 +460,7 @@ def request_new_certificate(
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 response_error = f"Failed to parse response: {e}"
                 print(f"Error parsing response: {e}")
+                print(f"Payload (raw): {msg.payload}")
 
         if status_code == "202" or status_code == "200":
             print(f"SUCCESS: Received certificate response (status {status_code})")
@@ -439,9 +494,10 @@ def request_new_certificate(
     print(f"Test message sent (mid: {test_result.mid})")
 
     # Publish CSR request
-    payload = json.dumps({"id": device_id, "csr": csr_data})
-    print(f"Publishing CSR to: {publish_topic}")
-    print(f"Payload: {payload}")
+    payload_dict = {"id": device_id, "csr": csr_data}
+    payload = json.dumps(payload_dict)
+    print(f"Topic: {publish_topic}")
+    print(f"Payload:\n{json.dumps(payload_dict, indent=2)}")
 
     result = client.publish(publish_topic, payload=payload, qos=1)
     if result.rc != mqtt.MQTT_ERR_SUCCESS:
@@ -458,7 +514,7 @@ def request_new_certificate(
     print(f"\nWaiting for credential response (timeout: {CREDENTIAL_RESPONSE_TIMEOUT}s)...")
     print("Sending keepalive messages every 5 seconds...")
 
-    while not response_received and _running:
+    while _running and not response_cert and not response_error:
         elapsed = time.time() - start_time
         if elapsed >= CREDENTIAL_RESPONSE_TIMEOUT:
             raise RuntimeError(f"Timeout waiting for credential response after {CREDENTIAL_RESPONSE_TIMEOUT} seconds")
@@ -482,6 +538,9 @@ def request_new_certificate(
     if not response_cert:
         raise RuntimeError("No certificate received in response")
 
+    # Print friendly view of the certificate chain
+    print_certificate_chain(response_cert)
+
     # Convert certificate to PEM format
     cert_pem = x509_certificate_list_to_pem(response_cert)
 
@@ -494,42 +553,41 @@ def request_new_certificate(
     return renewed_cert_path
 
 
-def send_messages_mqtt(client: mqtt.Client, device_id: str) -> None:
-    """Send telemetry messages in a loop using MQTT.
+def send_messages_mqtt(client: mqtt.Client, device_id: str, message_count: int = 3) -> None:
+    """Send telemetry messages using MQTT.
 
     Args:
         client: Connected MQTT client.
         device_id: Device ID.
+        message_count: Number of messages to send (default: 3).
     """
     global _running
-    message_count = 0
 
     # Telemetry topic for Azure IoT Hub
     telemetry_topic = f"devices/{device_id}/messages/events/"
 
-    print(f"\nSending messages every {MESSAGE_INTERVAL} seconds (Ctrl+C to stop)...")
+    print(f"\nSending {message_count} messages...")
 
-    while _running:
+    sent_count = 0
+    for i in range(message_count):
+        if not _running:
+            break
+
         try:
             message_data = create_msg(MESSAGE_SIZE)
 
             result = client.publish(telemetry_topic, payload=message_data, qos=1)
-            message_count += 1
-            print(f"Message {message_count} sent ({len(message_data)} bytes, mid: {result.mid})")
+            sent_count += 1
+            print(f"Message {sent_count}/{message_count} sent ({len(message_data)} bytes, mid: {result.mid})")
 
-            # Sleep in small increments to allow faster Ctrl+C response
-            for _ in range(MESSAGE_INTERVAL * 10):
-                if not _running:
-                    break
-                time.sleep(0.1)
+            # Brief pause between messages (except after the last one)
+            if i < message_count - 1:
+                time.sleep(1)
 
         except Exception as e:
             print(f"Error sending message: {e}")
-            if _running:
-                print("Retrying in 5 seconds...")
-                time.sleep(5)
 
-    print(f"\nTotal messages sent: {message_count}")
+    print(f"\nTotal messages sent: {sent_count}")
 
 
 def main() -> int:
@@ -581,8 +639,9 @@ def main() -> int:
         print("\n" + "=" * 70)
         print("STEP 3: Creating new CSR for certificate renewal")
         print("=" * 70)
-        csr_data = create_csr(private_key, args.device_name)
+        csr_data, csr_obj = create_csr(private_key, args.device_name)
         print(f"CSR created (length: {len(csr_data)} chars)")
+        print_csr_details(csr_obj)
 
         # Step 4: Request new certificate via MQTT
         print("\n" + "=" * 70)
