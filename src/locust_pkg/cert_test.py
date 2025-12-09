@@ -655,6 +655,8 @@ def main() -> int:
             device_name=args.device_name,
         )
 
+        time.sleep(5)  # Pause before disconnecting to ensure final ack is sent
+
         # Step 5: Disconnect and reconnect with renewed certificate
         print("\n" + "=" * 70)
         print("STEP 5: Reconnecting with renewed certificate")
