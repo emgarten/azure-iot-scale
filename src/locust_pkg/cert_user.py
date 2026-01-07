@@ -49,7 +49,7 @@ class CertUser(User):
         CERT_REPLACE_ENABLED: Enable certificate replacement mode (default: "false")
     """
 
-    wait_time = constant_pacing(cert_request_interval)  # type: ignore[no-untyped-call]
+    wait_time = constant_pacing(cert_request_interval / devices_per_user)  # type: ignore[no-untyped-call]
     _device_counter: int = 0  # Class-level counter for unique device numbering
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
 
