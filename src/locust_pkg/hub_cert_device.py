@@ -28,7 +28,7 @@ from cryptography.x509.oid import NameOID
 
 from storage import load_device_data as _load_device_data
 from storage import save_device_data as _save_device_data
-from utils import retry_with_backoff, x509_certificate_list_to_pem
+from utils import parse_request_id_from_topic, retry_with_backoff, x509_certificate_list_to_pem
 
 logger = logging.getLogger("locust.hub_cert_device")
 
@@ -99,6 +99,9 @@ class HubCertDevice:
 
         # Track last certificate chain response time (ticks from time.time())
         self.last_cert_chain_response_time: Optional[float] = None
+
+        # Track pending requests: request_id -> send_time (ticks from time.time())
+        self.pending_requests: dict[int, float] = {}
 
     def save_device_data(self, data_dict: dict[str, Any]) -> None:
         """Save device data to Azure Blob Storage with Locust event tracking.
@@ -483,6 +486,15 @@ class HubCertDevice:
         if len(parts) >= 4:
             status_code = parts[3]
 
+        # Extract request_id from topic using helper function
+        request_id = parse_request_id_from_topic(msg.topic)
+
+        # Calculate response time from pending requests
+        response_time_ms = 0
+        if request_id is not None and request_id in self.pending_requests:
+            send_time = self.pending_requests[request_id]
+            response_time_ms = int((time.time() - send_time) * 1000)
+
         payload_size = len(msg.payload) if msg.payload else 0
 
         # Parse payload
@@ -506,12 +518,12 @@ class HubCertDevice:
 
         # Handle based on status code
         if status_code == "202":
-            # Request accepted, waiting for certificate
+            # Request accepted, waiting for certificate (don't remove from pending_requests)
             logger.debug(f"Credential request accepted for {self.device_name}")
             self.environment.events.request.fire(
                 request_type="Hub",
                 name="credential_accept",
-                response_time=0,
+                response_time=response_time_ms,
                 response_length=payload_size,
                 exception=None,
                 context={"device_name": self.device_name, "status_code": status_code},
@@ -528,7 +540,7 @@ class HubCertDevice:
                     self.environment.events.request.fire(
                         request_type="Hub",
                         name="credential_certificate",
-                        response_time=0,
+                        response_time=response_time_ms,
                         response_length=payload_size,
                         exception=None,
                         context={"device_name": self.device_name, "status_code": status_code},
@@ -539,7 +551,7 @@ class HubCertDevice:
                     self.environment.events.request.fire(
                         request_type="Hub",
                         name="credential_missing_certificates",
-                        response_time=0,
+                        response_time=response_time_ms,
                         response_length=payload_size,
                         exception="Certificates array is empty",
                         context={"device_name": self.device_name, "status_code": status_code},
@@ -550,11 +562,15 @@ class HubCertDevice:
                 self.environment.events.request.fire(
                     request_type="Hub",
                     name="credential_missing_certificates",
-                    response_time=0,
+                    response_time=response_time_ms,
                     response_length=payload_size,
                     exception="No certificates field in response",
                     context={"device_name": self.device_name, "status_code": status_code},
                 )
+
+            # Remove from pending_requests for non-202 responses
+            if request_id is not None and request_id in self.pending_requests:
+                del self.pending_requests[request_id]
 
         else:
             # Unexpected status code
@@ -562,11 +578,15 @@ class HubCertDevice:
             self.environment.events.request.fire(
                 request_type="Hub",
                 name="credential_unexpected_status",
-                response_time=0,
+                response_time=response_time_ms,
                 response_length=payload_size,
                 exception=f"Unexpected status code: {status_code}",
                 context={"device_name": self.device_name, "status_code": status_code},
             )
+
+            # Remove from pending_requests for non-202 responses
+            if request_id is not None and request_id in self.pending_requests:
+                del self.pending_requests[request_id]
 
     def connect(self) -> bool:
         """Connect to IoT Hub via Paho MQTT.
@@ -766,6 +786,9 @@ class HubCertDevice:
             result = self.client.publish(publish_topic, payload=payload, qos=1)
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise Exception(f"Failed to publish CSR request: {result.rc}")
+
+            # Store the request_id and send time for response time calculation
+            self.pending_requests[request_id] = time.time()
 
             # Log success (request sent, not waiting for response)
             total_time = int((time.time() - start_time) * 1000)

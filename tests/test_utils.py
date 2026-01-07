@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import orjson
 
-from locust_pkg.utils import create_msg, x509_certificate_list_to_pem
+from locust_pkg.utils import create_msg, parse_request_id_from_topic, x509_certificate_list_to_pem
 
 
 class TestCreateMsg:
@@ -242,3 +242,85 @@ class TestX509CertificateListToPem:
         assert "\r\n" in result
         # Should not have Unix-style line endings alone
         assert result.replace("\r\n", "") == result.replace("\n", "").replace("\r", "")
+
+
+class TestParseRequestIdFromTopic:
+    """Tests for the parse_request_id_from_topic function."""
+
+    def test_valid_topic_with_rid(self) -> None:
+        """Test parsing a valid topic with $rid parameter."""
+        topic = "$iothub/credentials/res/202/?$rid=66641568"
+        result = parse_request_id_from_topic(topic)
+        assert result == 66641568
+
+    def test_valid_topic_with_rid_and_version(self) -> None:
+        """Test parsing a topic with $rid and other parameters."""
+        topic = "$iothub/credentials/res/200/?$rid=12345&$version=1"
+        result = parse_request_id_from_topic(topic)
+        assert result == 12345
+
+    def test_topic_with_rid_not_first_param(self) -> None:
+        """Test parsing when $rid is not the first query parameter."""
+        topic = "$iothub/credentials/res/200/?$version=1&$rid=99999"
+        result = parse_request_id_from_topic(topic)
+        assert result == 99999
+
+    def test_topic_without_rid(self) -> None:
+        """Test parsing a topic without $rid parameter."""
+        topic = "$iothub/credentials/res/202/?$version=1"
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_topic_with_empty_query_string(self) -> None:
+        """Test parsing a topic with empty query string."""
+        topic = "$iothub/credentials/res/202/?"
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_topic_without_query_string(self) -> None:
+        """Test parsing a topic without query string."""
+        topic = "$iothub/credentials/res/202"
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_topic_with_invalid_rid_value(self) -> None:
+        """Test parsing a topic with non-integer $rid value."""
+        topic = "$iothub/credentials/res/202/?$rid=invalid"
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_topic_with_empty_rid_value(self) -> None:
+        """Test parsing a topic with empty $rid value."""
+        topic = "$iothub/credentials/res/202/?$rid="
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_short_topic(self) -> None:
+        """Test parsing a topic with fewer than 5 parts."""
+        topic = "$iothub/credentials/res"
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_empty_topic(self) -> None:
+        """Test parsing an empty topic string."""
+        topic = ""
+        result = parse_request_id_from_topic(topic)
+        assert result is None
+
+    def test_topic_with_large_rid(self) -> None:
+        """Test parsing a topic with a large request ID."""
+        topic = "$iothub/credentials/res/200/?$rid=99999999"
+        result = parse_request_id_from_topic(topic)
+        assert result == 99999999
+
+    def test_topic_with_rid_value_one(self) -> None:
+        """Test parsing a topic with request ID of 1."""
+        topic = "$iothub/credentials/res/202/?$rid=1"
+        result = parse_request_id_from_topic(topic)
+        assert result == 1
+
+    def test_topic_with_multiple_query_params(self) -> None:
+        """Test parsing a topic with many query parameters."""
+        topic = "$iothub/credentials/res/200/?foo=bar&$rid=54321&$version=2&other=value"
+        result = parse_request_id_from_topic(topic)
+        assert result == 54321

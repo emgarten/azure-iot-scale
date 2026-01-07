@@ -3,7 +3,7 @@ import os
 from typing import Any, Optional
 
 import orjson
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
 logger = logging.getLogger("locust.storage")
@@ -35,7 +35,9 @@ def get_blob_service_client() -> BlobServiceClient:
         if storage_conn_str is not None:
             _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
         elif storage_account_url is not None:
-            credential = DefaultAzureCredential()
+            # Try Azure CLI first (fast for local dev), then fall back to DefaultAzureCredential
+            # (which includes ManagedIdentity, environment vars, etc. for cloud environments)
+            credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
             _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
         else:
             raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
