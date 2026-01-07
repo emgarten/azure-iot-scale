@@ -693,7 +693,7 @@ class HubCertDevice:
             return None
         return time.time() - self.last_cert_chain_response_time
 
-    def request_new_certificate(self) -> bool:
+    def request_new_certificate(self, replace: bool = False) -> bool:
         """Request a new certificate from IoT Hub via MQTT credential management API.
 
         This method sends a CSR to request a new certificate using the persistent
@@ -701,6 +701,9 @@ class HubCertDevice:
         by the observer pattern via _credential_on_message callback.
 
         The MQTT connection must be established first via connect().
+
+        Args:
+            replace: If True, include "replace": "*" in the payload to replace existing certificates.
 
         Returns:
             True if the request was successfully sent, False otherwise.
@@ -752,7 +755,10 @@ class HubCertDevice:
             csr_data = self._create_csr()
             request_id = random.randint(1, 99999999)
             publish_topic = f"$iothub/credentials/POST/issueCertificate/?$rid={request_id}"
-            payload = json.dumps({"id": device_id, "csr": csr_data})
+            payload_dict: dict[str, str] = {"id": device_id, "csr": csr_data}
+            if replace:
+                payload_dict["replace"] = "*"
+            payload = json.dumps(payload_dict)
 
             logger.debug(f"Sending credential request to {publish_topic}")
             # At this point client is guaranteed to be non-None (checked above)

@@ -33,6 +33,7 @@ logger = logging.getLogger("locust.cert_user")
 cert_request_interval = int(os.getenv("CERT_REQUEST_INTERVAL", "90"))  # seconds
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
 devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
+cert_replace_enabled = os.getenv("CERT_REPLACE_ENABLED", "false").lower() == "true"
 
 
 class CertUser(User):
@@ -45,6 +46,7 @@ class CertUser(User):
         DEVICES_PER_USER: Number of devices per Locust user (default: 1)
         CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 90)
         DEVICE_NAME_PREFIX: Prefix for device names (default: "device-")
+        CERT_REPLACE_ENABLED: Enable certificate replacement mode (default: "false")
     """
 
     wait_time = constant_pacing(cert_request_interval)  # type: ignore[no-untyped-call]
@@ -149,7 +151,7 @@ class CertUser(User):
                 logger.warning(f"Failed to connect device {device.device_name}, skipping")
                 return
 
-        device.request_new_certificate()
+        device.request_new_certificate(replace=cert_replace_enabled)
 
     def on_stop(self) -> None:
         """Cleanup method called when the user stops."""

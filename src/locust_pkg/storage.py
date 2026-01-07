@@ -8,7 +8,13 @@ from azure.storage.blob import BlobServiceClient
 
 logger = logging.getLogger("locust.storage")
 
+# Storage authentication (in order of preference):
+# 1. STORAGE_CONN_STR - Connection string for the storage account
+# 2. STORAGE_ACCOUNT_URL - Account URL (e.g., https://<account>.blob.core.windows.net)
+#    with DefaultAzureCredential (managed identity, Azure CLI, etc.)
+# At least one must be set, otherwise an exception is raised.
 storage_conn_str = os.getenv("STORAGE_CONN_STR")
+storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
 storage_container_name = os.getenv("STORAGE_CONTAINER_NAME", "scale")
 counter_blob_prefix = os.getenv("COUNTER_BLOB_PREFIX", "counter")
 device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
@@ -26,15 +32,13 @@ def get_blob_service_client() -> BlobServiceClient:
     global _blob_service_client
 
     if _blob_service_client is None:
-        if storage_conn_str is None:
-            # Use default Azure credentials (managed identity, Azure CLI, etc.)
-            storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
-            if storage_account_url is None:
-                raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
+        if storage_conn_str is not None:
+            _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
+        elif storage_account_url is not None:
             credential = DefaultAzureCredential()
             _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
         else:
-            _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
+            raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
 
     return _blob_service_client
 
