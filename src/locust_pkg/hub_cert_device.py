@@ -103,6 +103,124 @@ class HubCertDevice:
         # Track pending requests: request_id -> send_time (ticks from time.time())
         self.pending_requests: dict[int, float] = {}
 
+        # Track disconnect reason for debugging
+        self._last_disconnect_rc: Optional[int] = None
+
+    def _is_actually_connected(self) -> bool:
+        """Check if MQTT client is actually connected.
+
+        This method checks both the internal flag and the actual MQTT client state
+        to provide an accurate picture of connectivity. This is important for
+        detecting unexpected disconnections.
+
+        Returns:
+            True if the client is actually connected, False otherwise.
+        """
+        if not self.is_connected:
+            return False
+        if self.client is None:
+            return False
+        return bool(self.client.is_connected())
+
+    def _cleanup_pending_requests(self, max_age_seconds: float = 600) -> None:
+        """Clean up stale pending requests that have timed out.
+
+        This prevents memory leaks from requests that never received responses
+        due to disconnections or other issues.
+
+        Args:
+            max_age_seconds: Maximum age in seconds before a request is considered stale.
+                           Default is 600 seconds (10 minutes).
+        """
+        if not self.pending_requests:
+            return
+
+        current_time = time.time()
+        stale_request_ids = [
+            request_id
+            for request_id, send_time in self.pending_requests.items()
+            if (current_time - send_time) > max_age_seconds
+        ]
+
+        for request_id in stale_request_ids:
+            del self.pending_requests[request_id]
+
+        if stale_request_ids:
+            logger.debug(f"Cleaned up {len(stale_request_ids)} stale pending requests for {self.device_name}")
+
+    def _on_connect(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        flags: dict[str, Any],
+        rc: int,
+    ) -> None:
+        """Handle MQTT connection events.
+
+        This callback is invoked when the MQTT client connects or fails to connect.
+
+        Args:
+            client: The MQTT client instance
+            userdata: User data (unused)
+            flags: Response flags from the broker
+            rc: Result code (0 = success, non-zero = failure)
+        """
+        if rc == 0:
+            self.is_connected = True
+            self._last_disconnect_rc = None
+            logger.info(f"MQTT connected for {self.device_name}")
+        else:
+            self.is_connected = False
+            logger.error(f"MQTT connection failed for {self.device_name}, rc={rc}")
+            self.environment.events.request.fire(
+                request_type="Hub",
+                name="connect_callback_error",
+                response_time=0,
+                response_length=0,
+                exception=f"Connection callback failed with rc={rc}",
+                context={"device_name": self.device_name, "rc": rc},
+            )
+
+    def _on_disconnect(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        rc: int,
+    ) -> None:
+        """Handle MQTT disconnection events.
+
+        This callback is invoked when the MQTT client disconnects, either
+        expectedly (rc=0) or unexpectedly (rc!=0).
+
+        Args:
+            client: The MQTT client instance
+            userdata: User data (unused)
+            rc: Result code (0 = expected disconnect, non-zero = unexpected)
+        """
+        was_connected = self.is_connected
+        self.is_connected = False
+        self._last_disconnect_rc = rc
+
+        if rc != 0:
+            # Unexpected disconnection
+            logger.warning(f"Unexpected MQTT disconnect for {self.device_name}, rc={rc}")
+            if was_connected:
+                self.environment.events.request.fire(
+                    request_type="Hub",
+                    name="disconnect_error",
+                    response_time=0,
+                    response_length=0,
+                    exception=f"Unexpected disconnect with rc={rc}",
+                    context={"device_name": self.device_name, "rc": rc},
+                )
+        else:
+            logger.debug(f"MQTT disconnected for {self.device_name} (expected)")
+
+        # Clean up all pending requests on disconnect since they won't receive responses
+        if self.pending_requests:
+            logger.debug(f"Clearing {len(self.pending_requests)} pending requests on disconnect for {self.device_name}")
+            self.pending_requests.clear()
+
     def save_device_data(self, data_dict: dict[str, Any]) -> None:
         """Save device data to Azure Blob Storage with Locust event tracking.
 
@@ -595,12 +713,21 @@ class HubCertDevice:
         credential response topic. The connection remains open for the lifetime of the
         device to handle multiple certificate requests using the observer pattern.
 
+        If called when already connected, it verifies the connection is still active.
+        If the connection was lost, it will clean up and reconnect.
+
         Returns:
             True if connection and subscription were successful, False otherwise.
         """
-        if self.is_connected and self.client is not None:
+        # Check if we're actually connected (not just think we are)
+        if self._is_actually_connected():
             logger.debug(f"Already connected for {self.device_name}")
             return True
+
+        # If we thought we were connected but aren't, clean up first
+        if self.is_connected or self.client is not None:
+            logger.info(f"Stale connection detected for {self.device_name}, cleaning up before reconnect")
+            self._disconnect()
 
         if self.registration_result is None or self.registration_result.registration_state is None:
             logger.error("Cannot connect: no registration result")
@@ -647,7 +774,9 @@ class HubCertDevice:
             ssl_context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
             self.client.tls_set_context(ssl_context)
 
-            # Set message callback (observer pattern)
+            # Set callbacks for connection state tracking
+            self.client.on_connect = self._on_connect
+            self.client.on_disconnect = self._on_disconnect
             self.client.on_message = self._credential_on_message
 
             # Connect to IoT Hub
@@ -720,7 +849,9 @@ class HubCertDevice:
         MQTT connection. It is fire-and-forget - responses are handled asynchronously
         by the observer pattern via _credential_on_message callback.
 
-        The MQTT connection must be established first via connect().
+        This method handles automatic reconnection if the connection was lost.
+        It checks the actual MQTT connection state (not just the flag) and will
+        reconnect if needed.
 
         Args:
             replace: If True, include "replace": "*" in the payload to replace existing certificates.
@@ -752,8 +883,13 @@ class HubCertDevice:
             )
             return False
 
-        # Ensure MQTT client is connected
-        if not self.is_connected or self.client is None:
+        # Check actual connection state and reconnect if needed
+        # This handles both "never connected" and "connection was lost" cases
+        if not self._is_actually_connected():
+            # Clean up stale pending requests before reconnect
+            self._cleanup_pending_requests()
+
+            logger.info(f"Device {self.device_name} not connected, attempting to connect")
             if not self.connect():
                 logger.error("Cannot request new certificate: connection failed")
                 self.environment.events.request.fire(
