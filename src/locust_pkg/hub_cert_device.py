@@ -97,6 +97,9 @@ class HubCertDevice:
         self.cert_file: Optional[str] = None
         self.key_file: Optional[str] = None
 
+        # Track last certificate chain response time (ticks from time.time())
+        self.last_cert_chain_response_time: Optional[float] = None
+
     def save_device_data(self, data_dict: dict[str, Any]) -> None:
         """Save device data to Azure Blob Storage with Locust event tracking.
 
@@ -519,7 +522,8 @@ class HubCertDevice:
             if payload_data and "certificates" in payload_data:
                 cert_data = payload_data["certificates"]
                 if isinstance(cert_data, list) and len(cert_data) > 0:
-                    # Certificate chain received
+                    # Certificate chain received - record timestamp
+                    self.last_cert_chain_response_time = time.time()
                     logger.info(f"Certificate chain received for {self.device_name}")
                     self.environment.events.request.fire(
                         request_type="Hub",
@@ -677,6 +681,17 @@ class HubCertDevice:
             # Clean up on failure
             self._disconnect()
             return False
+
+    def get_time_since_last_cert_response(self) -> Optional[float]:
+        """Get the time elapsed since the last certificate chain response.
+
+        Returns:
+            Seconds since the last certificate chain was received, or None if
+            no certificate chain has been received yet.
+        """
+        if self.last_cert_chain_response_time is None:
+            return None
+        return time.time() - self.last_cert_chain_response_time
 
     def request_new_certificate(self) -> bool:
         """Request a new certificate from IoT Hub via MQTT credential management API.

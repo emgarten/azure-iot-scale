@@ -30,7 +30,7 @@ from storage import initialize_storage  # noqa: E402
 logger = logging.getLogger("locust.cert_user")
 
 # Environment configuration
-cert_request_interval = int(os.getenv("CERT_REQUEST_INTERVAL", "5"))  # seconds
+cert_request_interval = int(os.getenv("CERT_REQUEST_INTERVAL", "90"))  # seconds
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
 devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
 
@@ -43,7 +43,7 @@ class CertUser(User):
 
     Environment Variables:
         DEVICES_PER_USER: Number of devices per Locust user (default: 1)
-        CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 5)
+        CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 90)
         DEVICE_NAME_PREFIX: Prefix for device names (default: "device-")
     """
 
@@ -73,59 +73,81 @@ class CertUser(User):
 
         logger.info(f"Starting CertUser with {devices_per_user} device(s)")
 
-        # Initialize devices with failure isolation
+        # Create device instances only - provisioning and connecting happens lazily in request_certificate
         for i in range(devices_per_user):
             device_name = self.get_device_name()
-            logger.info(f"Initializing device {i + 1}/{devices_per_user}: {device_name}")
+            logger.info(f"Creating device {i + 1}/{devices_per_user}: {device_name}")
 
             try:
                 device = HubCertDevice(device_name, self.environment)
-
-                # Provision the device (loads from storage or provisions via DPS)
-                if not device.provision():
-                    logger.warning(f"Failed to provision device {device_name}, skipping")
-                    continue
-
-                # Connect to IoT Hub
-                if not device.connect():
-                    logger.warning(f"Failed to connect device {device_name}, skipping")
-                    continue
-
                 self.devices.append(device)
-                logger.info(f"Device {device_name} ready")
+                logger.info(f"Device {device_name} created")
 
             except Exception as e:
                 # Failure isolation - log and continue with other devices
-                logger.error(f"Failed to initialize device {device_name}: {e}")
+                logger.error(f"Failed to create device {device_name}: {e}")
                 continue
 
-        logger.info(f"CertUser initialized with {len(self.devices)} connected device(s)")
+        logger.info(f"CertUser initialized with {len(self.devices)} device(s)")
 
     def _get_next_device(self) -> HubCertDevice | None:
-        """Get the next connected device in round-robin fashion.
+        """Get the next device in round-robin fashion.
 
         Returns:
-            The next connected device, or None if no devices are connected.
+            The next device, or None if no devices exist.
         """
-        # Filter to only connected devices
-        connected_devices = [d for d in self.devices if d.is_connected]
-
-        if not connected_devices:
+        if not self.devices:
             return None
 
-        # Round-robin selection
-        device = connected_devices[self._current_device_index % len(connected_devices)]
+        # Round-robin selection across all devices (regardless of status)
+        device = self.devices[self._current_device_index % len(self.devices)]
         self._current_device_index += 1
         return device
 
+    def _is_device_provisioned(self, device: HubCertDevice) -> bool:
+        """Check if a device has been successfully provisioned.
+
+        Args:
+            device: The device to check
+
+        Returns:
+            True if the device is provisioned and assigned, False otherwise.
+        """
+        return device.registration_result is not None and device.registration_result.status == "assigned"
+
     @task
     def request_certificate(self) -> None:
-        """Request a certificate renewal from the next device in round-robin order."""
+        """Request a certificate renewal from the next device in round-robin order.
+
+        This method handles lazy initialization:
+        - If the device hasn't been provisioned, provision it first
+        - If the device isn't connected, connect it first
+        - Emit the duration since the last certificate response (if available)
+        """
         device = self._get_next_device()
 
         if device is None:
-            logger.warning("No connected devices available, skipping certificate request")
+            logger.warning("No devices available, skipping certificate request")
             return
+
+        # Emit time since last certificate response (if available)
+        time_since_last = device.get_time_since_last_cert_response()
+        if time_since_last is not None:
+            logger.info(f"Device {device.device_name}: {time_since_last:.2f}s since last cert response")
+
+        # Lazy provisioning: provision if not already provisioned
+        if not self._is_device_provisioned(device):
+            logger.info(f"Device {device.device_name} not provisioned, provisioning now")
+            if not device.provision():
+                logger.warning(f"Failed to provision device {device.device_name}, skipping")
+                return
+
+        # Lazy connection: connect if not connected
+        if not device.is_connected:
+            logger.info(f"Device {device.device_name} not connected, connecting now")
+            if not device.connect():
+                logger.warning(f"Failed to connect device {device.device_name}, skipping")
+                return
 
         device.request_new_certificate()
 
