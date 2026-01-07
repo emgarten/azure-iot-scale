@@ -1,20 +1,25 @@
 """Utility module for IoT Hub certificate-based device operations.
 
 This module provides the HubCertDevice class which encapsulates all functionality
-for provisioning, connecting, and communicating with Azure IoT Hub using X.509
-certificates. It is designed to be used by Locust users for load testing.
+for provisioning and connecting to Azure IoT Hub using X.509 certificates.
+It uses DPS for initial provisioning and Paho MQTT for hub connections.
+Designed for load testing certificate renewal operations.
 """
 
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
+import random
+import ssl
 import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
+import paho.mqtt.client as mqtt
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -23,7 +28,7 @@ from cryptography.x509.oid import NameOID
 
 from storage import load_device_data as _load_device_data
 from storage import save_device_data as _save_device_data
-from utils import create_msg, retry_with_backoff, x509_certificate_list_to_pem
+from utils import retry_with_backoff, x509_certificate_list_to_pem
 
 logger = logging.getLogger("locust.hub_cert_device")
 
@@ -31,6 +36,11 @@ logger = logging.getLogger("locust.hub_cert_device")
 provisioning_host = os.getenv("PROVISIONING_HOST")
 id_scope = os.getenv("PROVISIONING_IDSCOPE")
 dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
+
+# MQTT configuration for credential management
+MQTT_PORT = 8883
+API_VERSION = "2025-08-01-preview"
+credential_response_timeout = int(os.getenv("CREDENTIAL_RESPONSE_TIMEOUT", "300"))  # Default 5 minutes
 
 
 class RegistrationState:
@@ -55,8 +65,8 @@ class HubCertDevice:
 
     This class encapsulates all functionality for a single IoT Hub device including:
     - Device provisioning via DPS
-    - Hub connection with X.509 certificates
-    - Message sending
+    - Hub connection with X.509 certificates via Paho MQTT
+    - Certificate renewal requests
     - State persistence to Azure Blob Storage
     - Locust metrics emission
 
@@ -64,7 +74,7 @@ class HubCertDevice:
         device = HubCertDevice("device-001", environment)
         if device.provision():
             if device.connect():
-                device.send_message(256)
+                device.request_new_certificate()
         device.disconnect()
     """
 
@@ -80,7 +90,9 @@ class HubCertDevice:
         self.private_key: Optional[EllipticCurvePrivateKey] = None
         self.issued_cert_data: str = ""
         self.registration_result: Optional[RegistrationResult] = None
-        self.device_client: Optional[Any] = None  # IoTHubDeviceClient loaded dynamically
+
+        # Paho MQTT client for hub connection
+        self.client: Optional[mqtt.Client] = None
         self.is_connected: bool = False
         self.cert_file: Optional[str] = None
         self.key_file: Optional[str] = None
@@ -386,24 +398,196 @@ class HubCertDevice:
 
         return self.registration_result is not None and self.registration_result.status == "assigned"
 
-    def _connect_inner(self) -> None:
-        """Inner hub connection logic to be wrapped with retry."""
-        # Import azure.iot.device after wheel is loaded
-        from azure.iot.device import IoTHubDeviceClient, X509
+    def disconnect(self) -> None:
+        """Disconnect from IoT Hub and clean up resources."""
+        self._disconnect()
 
-        # Load registration data from storage if not already in memory
-        if self.registration_result is None or self.private_key is None or not self.issued_cert_data:
-            device_data = self.load_device_data()
-            if device_data is not None:
-                logger.info("Loading device data from storage for connection")
-                if not self._restore_from_storage(device_data):
-                    raise Exception("Failed to restore device state from storage")
+    def _disconnect(self) -> None:
+        """Disconnect the MQTT client and clean up resources."""
+        if self.client is not None:
+            try:
+                logger.info(f"Disconnecting {self.device_name} from IoT Hub")
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception as e:
+                logger.debug(f"Error disconnecting MQTT client: {e}")
+            self.client = None
+
+        self.is_connected = False
+
+        # Clean up temporary certificate and key files
+        if self.cert_file and os.path.exists(self.cert_file):
+            try:
+                os.unlink(self.cert_file)
+            except Exception as e:
+                logger.debug(f"Error removing cert file: {e}")
+            self.cert_file = None
+
+        if self.key_file and os.path.exists(self.key_file):
+            try:
+                os.unlink(self.key_file)
+            except Exception as e:
+                logger.debug(f"Error removing key file: {e}")
+            self.key_file = None
+
+    def _create_csr(self) -> str:
+        """Create a CSR using the existing private key.
+
+        Returns:
+            Base64-encoded DER format CSR string.
+
+        Raises:
+            Exception: If no private key is available.
+        """
+        if self.private_key is None:
+            raise Exception("Cannot create CSR: no private key available")
+
+        csr_builder = x509.CertificateSigningRequestBuilder()
+        csr_builder = csr_builder.subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.device_name)]))
+        csr = csr_builder.sign(self.private_key, hashes.SHA256())
+
+        # Convert CSR to DER format and then base64 encode it
+        csr_der = csr.public_bytes(serialization.Encoding.DER)
+        return base64.b64encode(csr_der).decode("utf-8")
+
+    def _credential_on_message(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        msg: mqtt.MQTTMessage,
+    ) -> None:
+        """Handle credential response messages from IoT Hub (observer pattern).
+
+        This callback is invoked when messages arrive on the credential response topic.
+        It emits different Locust events based on the response type:
+        - credential_accept: Status 202 (request accepted, waiting for certificate)
+        - credential_certificate: Status 200 (certificate chain received)
+        - credential_parse_error: Failed to parse JSON response
+        - credential_unexpected_status: Unexpected status code
+        - credential_missing_certificates: Status 200 but no certificates in payload
+
+        Args:
+            client: The MQTT client instance
+            userdata: User data (unused)
+            msg: The MQTT message containing the credential response
+        """
+        logger.debug(f"Credential response received on topic: {msg.topic}")
+
+        # Extract status code from topic
+        # Topic format: $iothub/credentials/res/202/?$rid=999888777&$version=1
+        parts = msg.topic.split("/")
+        status_code = ""
+        if len(parts) >= 4:
+            status_code = parts[3]
+
+        payload_size = len(msg.payload) if msg.payload else 0
+
+        # Parse payload
+        payload_data: Optional[dict[str, Any]] = None
+        if msg.payload:
+            try:
+                payload_str = msg.payload.decode("utf-8")
+                payload_data = json.loads(payload_str)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # Emit parse error event
+                logger.error(f"Error parsing credential response: {e}")
+                self.environment.events.request.fire(
+                    request_type="Hub",
+                    name="credential_parse_error",
+                    response_time=0,
+                    response_length=payload_size,
+                    exception=f"Failed to parse response: {e}",
+                    context={"device_name": self.device_name, "status_code": status_code},
+                )
+                return
+
+        # Handle based on status code
+        if status_code == "202":
+            # Request accepted, waiting for certificate
+            logger.debug(f"Credential request accepted for {self.device_name}")
+            self.environment.events.request.fire(
+                request_type="Hub",
+                name="credential_accept",
+                response_time=0,
+                response_length=payload_size,
+                exception=None,
+                context={"device_name": self.device_name, "status_code": status_code},
+            )
+
+        elif status_code == "200":
+            # Certificate response - check if certificates are present
+            if payload_data and "certificates" in payload_data:
+                cert_data = payload_data["certificates"]
+                if isinstance(cert_data, list) and len(cert_data) > 0:
+                    # Certificate chain received
+                    logger.info(f"Certificate chain received for {self.device_name}")
+                    self.environment.events.request.fire(
+                        request_type="Hub",
+                        name="credential_certificate",
+                        response_time=0,
+                        response_length=payload_size,
+                        exception=None,
+                        context={"device_name": self.device_name, "status_code": status_code},
+                    )
+                else:
+                    # Empty certificates array
+                    logger.warning(f"Empty certificates array for {self.device_name}")
+                    self.environment.events.request.fire(
+                        request_type="Hub",
+                        name="credential_missing_certificates",
+                        response_time=0,
+                        response_length=payload_size,
+                        exception="Certificates array is empty",
+                        context={"device_name": self.device_name, "status_code": status_code},
+                    )
+            else:
+                # No certificates field in response
+                logger.warning(f"No certificates field in response for {self.device_name}")
+                self.environment.events.request.fire(
+                    request_type="Hub",
+                    name="credential_missing_certificates",
+                    response_time=0,
+                    response_length=payload_size,
+                    exception="No certificates field in response",
+                    context={"device_name": self.device_name, "status_code": status_code},
+                )
+
+        else:
+            # Unexpected status code
+            logger.warning(f"Credential request returned unexpected status {status_code} for {self.device_name}")
+            self.environment.events.request.fire(
+                request_type="Hub",
+                name="credential_unexpected_status",
+                response_time=0,
+                response_length=payload_size,
+                exception=f"Unexpected status code: {status_code}",
+                context={"device_name": self.device_name, "status_code": status_code},
+            )
+
+    def connect(self) -> bool:
+        """Connect to IoT Hub via Paho MQTT.
+
+        This method establishes a persistent MQTT connection and subscribes to the
+        credential response topic. The connection remains open for the lifetime of the
+        device to handle multiple certificate requests using the observer pattern.
+
+        Returns:
+            True if connection and subscription were successful, False otherwise.
+        """
+        if self.is_connected and self.client is not None:
+            logger.debug(f"Already connected for {self.device_name}")
+            return True
 
         if self.registration_result is None or self.registration_result.registration_state is None:
-            raise Exception("Cannot connect to hub: no registration result")
+            logger.error("Cannot connect: no registration result")
+            return False
 
-        if self.private_key is None:
-            raise Exception("Cannot connect to hub: no private key")
+        if self.private_key is None or not self.issued_cert_data:
+            logger.error("Cannot connect: missing private key or certificate")
+            return False
+
+        hostname = self.registration_result.registration_state.assigned_hub
+        device_id = self.registration_result.registration_state.device_id
 
         start_time = time.time()
 
@@ -415,167 +599,176 @@ class HubCertDevice:
                 encryption_algorithm=serialization.NoEncryption(),
             ).decode("utf-8")
 
-            # Write certificate and key to temporary files
-            # X509 class expects file paths, not file contents
+            # Write certificate and key to temporary files for MQTT TLS
             cert_fd, self.cert_file = tempfile.mkstemp(suffix=".pem", text=True)
             key_fd, self.key_file = tempfile.mkstemp(suffix=".pem", text=True)
 
-            try:
-                with os.fdopen(cert_fd, "w") as f:
-                    f.write(self.issued_cert_data)
-                with os.fdopen(key_fd, "w") as f:
-                    f.write(private_key_pem)
+            with os.fdopen(cert_fd, "w") as f:
+                f.write(self.issued_cert_data)
+            with os.fdopen(key_fd, "w") as f:
+                f.write(private_key_pem)
 
-                # Create X509 object with file paths
-                iot_hub_x509 = X509(self.cert_file, self.key_file)  # type: ignore[no-untyped-call]
+            # Create MQTT client
+            self.client = mqtt.Client(
+                client_id=device_id,
+                protocol=mqtt.MQTTv311,
+            )
 
-                # Create device client
-                self.device_client = IoTHubDeviceClient.create_from_x509_certificate(
-                    hostname=self.registration_result.registration_state.assigned_hub,
-                    device_id=self.registration_result.registration_state.device_id,
-                    x509=iot_hub_x509,
-                )
+            # Set username for Azure IoT Hub
+            username = f"{hostname}/{device_id}/?api-version={API_VERSION}"
+            self.client.username_pw_set(username=username)
 
-                # Connect the client (synchronous for gevent compatibility)
-                self.device_client.connect()
-                self.is_connected = True
+            # Configure TLS with client certificate
+            ssl_context = ssl.create_default_context()
+            ssl_context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+            self.client.tls_set_context(ssl_context)
 
-                # Log success
-                total_time = int((time.time() - start_time) * 1000)
-                logger.info(f"Device connected to IoT Hub: {self.registration_result.registration_state.assigned_hub}")
-                self.environment.events.request.fire(
-                    request_type="Hub",
-                    name="connect",
-                    response_time=total_time,
-                    response_length=0,
-                    exception=None,
-                    context={
-                        "device_id": self.registration_result.registration_state.device_id,
-                        "status": "connected",
-                    },
-                )
+            # Set message callback (observer pattern)
+            self.client.on_message = self._credential_on_message
 
-            except Exception:
-                # Clean up temp files on error
-                if self.cert_file and os.path.exists(self.cert_file):
-                    os.unlink(self.cert_file)
-                if self.key_file and os.path.exists(self.key_file):
-                    os.unlink(self.key_file)
-                self.cert_file = None
-                self.key_file = None
-                raise
+            # Connect to IoT Hub
+            logger.debug(f"Connecting to {hostname} via MQTT")
+            self.client.connect(hostname, MQTT_PORT, keepalive=60)
+            self.client.loop_start()
+
+            # Wait for connection
+            connect_timeout = 120
+            connect_start = time.time()
+            while not self.client.is_connected() and (time.time() - connect_start) < connect_timeout:
+                time.sleep(0.1)
+
+            if not self.client.is_connected():
+                raise Exception("Failed to connect to IoT Hub via MQTT")
+
+            # Subscribe to response topic (once, for the lifetime of the connection)
+            subscribe_topic = "$iothub/credentials/res/#"
+            result, _ = self.client.subscribe(subscribe_topic, qos=1)
+            if result != mqtt.MQTT_ERR_SUCCESS:
+                raise Exception(f"Failed to subscribe to {subscribe_topic}")
+
+            self.is_connected = True
+
+            # Log success
+            total_time = int((time.time() - start_time) * 1000)
+            logger.info(f"Connected to IoT Hub for {self.device_name}")
+            self.environment.events.request.fire(
+                request_type="Hub",
+                name="connect",
+                response_time=total_time,
+                response_length=0,
+                exception=None,
+                context={"device_name": self.device_name, "status": "connected"},
+            )
+            return True
 
         except Exception as e:
-            # Log as a locust error
+            # Log failure
             total_time = int((time.time() - start_time) * 1000)
-            logger.error(f"Failed to connect to IoT Hub: {str(e)}")
+            logger.error(f"Failed to connect for {self.device_name}: {e}")
             self.environment.events.request.fire(
                 request_type="Hub",
                 name="connect",
                 response_time=total_time,
                 response_length=0,
                 exception=str(e),
-                context={"status": "error"},
+                context={"device_name": self.device_name, "status": "error"},
             )
-            self.is_connected = False
-            # Re-raise to trigger retry
-            raise
 
-    def connect(self) -> bool:
-        """Connect to IoT Hub using X.509 certificate from provisioning.
-
-        Uses retry logic for resilience.
-
-        Returns:
-            True if connection is successful, False otherwise.
-        """
-        try:
-            retry_with_backoff(
-                operation_name=f"connect_hub({self.device_name})",
-                operation_func=self._connect_inner,
-                base_wait=60,
-                max_jitter=30,
-            )
-            return self.is_connected
-        except Exception as e:
-            logger.error(f"Connection failed for {self.device_name}: {e}")
+            # Clean up on failure
+            self._disconnect()
             return False
 
-    def send_message(self, message_size: int) -> bool:
-        """Send a single telemetry message to IoT Hub.
+    def request_new_certificate(self) -> bool:
+        """Request a new certificate from IoT Hub via MQTT credential management API.
 
-        Args:
-            message_size: Size of the message payload in bytes
+        This method sends a CSR to request a new certificate using the persistent
+        MQTT connection. It is fire-and-forget - responses are handled asynchronously
+        by the observer pattern via _credential_on_message callback.
+
+        The MQTT connection must be established first via connect().
 
         Returns:
-            True if message was sent successfully, False otherwise.
+            True if the request was successfully sent, False otherwise.
         """
-        # Import azure.iot.device after wheel is loaded
-        from azure.iot.device import Message
-
-        # Ensure device is connected before sending
-        if not self.is_connected or self.device_client is None:
-            logger.warning(f"Device {self.device_name} not connected, skipping message send")
+        if self.registration_result is None or self.registration_result.registration_state is None:
+            logger.error("Cannot request new certificate: no registration result")
+            self.environment.events.request.fire(
+                request_type="Hub",
+                name="credential_request",
+                response_time=0,
+                response_length=0,
+                exception="No registration result",
+                context={"device_name": self.device_name, "status": "error"},
+            )
             return False
+
+        if self.private_key is None:
+            logger.error("Cannot request new certificate: no private key")
+            self.environment.events.request.fire(
+                request_type="Hub",
+                name="credential_request",
+                response_time=0,
+                response_length=0,
+                exception="No private key",
+                context={"device_name": self.device_name, "status": "error"},
+            )
+            return False
+
+        # Ensure MQTT client is connected
+        if not self.is_connected or self.client is None:
+            if not self.connect():
+                logger.error("Cannot request new certificate: connection failed")
+                self.environment.events.request.fire(
+                    request_type="Hub",
+                    name="credential_request",
+                    response_time=0,
+                    response_length=0,
+                    exception="Connection failed",
+                    context={"device_name": self.device_name, "status": "error"},
+                )
+                return False
+
+        device_id = self.registration_result.registration_state.device_id
 
         start_time = time.time()
 
         try:
-            # Create and send message
-            message_data = create_msg(message_size)
-            msg = Message(message_data)  # type: ignore[no-untyped-call]
+            # Create CSR and publish request
+            csr_data = self._create_csr()
+            request_id = random.randint(1, 99999999)
+            publish_topic = f"$iothub/credentials/POST/issueCertificate/?$rid={request_id}"
+            payload = json.dumps({"id": device_id, "csr": csr_data})
 
-            # Send message (synchronous for gevent compatibility)
-            self.device_client.send_message(msg)
+            logger.debug(f"Sending credential request to {publish_topic}")
+            # At this point client is guaranteed to be non-None (checked above)
+            assert self.client is not None
+            result = self.client.publish(publish_topic, payload=payload, qos=1)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise Exception(f"Failed to publish CSR request: {result.rc}")
 
-            # Log success
+            # Log success (request sent, not waiting for response)
             total_time = int((time.time() - start_time) * 1000)
-            logger.debug(f"Message sent successfully from {self.device_name}")
+            logger.info(f"Certificate request sent for {self.device_name}")
             self.environment.events.request.fire(
                 request_type="Hub",
-                name="send_message",
+                name="credential_request",
                 response_time=total_time,
-                response_length=len(msg.data),
+                response_length=len(payload),
                 exception=None,
                 context={"device_name": self.device_name, "status": "sent"},
             )
             return True
 
         except Exception as e:
-            # Log as a locust error
+            # Log failure
             total_time = int((time.time() - start_time) * 1000)
-            logger.error(f"Failed to send message from {self.device_name}: {str(e)}")
+            logger.error(f"Failed to send certificate request for {self.device_name}: {e}")
             self.environment.events.request.fire(
                 request_type="Hub",
-                name="send_message",
+                name="credential_request",
                 response_time=total_time,
                 response_length=0,
                 exception=str(e),
                 context={"device_name": self.device_name, "status": "error"},
             )
             return False
-
-    def disconnect(self) -> None:
-        """Disconnect from IoT Hub and clean up resources."""
-        if self.device_client is not None and self.is_connected:
-            try:
-                logger.info(f"Disconnecting {self.device_name} from IoT Hub")
-                self.device_client.shutdown()
-                self.is_connected = False
-            except Exception as e:
-                logger.error(f"Error during shutdown for {self.device_name}: {str(e)}")
-
-        # Clean up temporary certificate and key files
-        if self.cert_file and os.path.exists(self.cert_file):
-            try:
-                os.unlink(self.cert_file)
-            except Exception as e:
-                logger.error(f"Error removing cert file: {str(e)}")
-            self.cert_file = None
-
-        if self.key_file and os.path.exists(self.key_file):
-            try:
-                os.unlink(self.key_file)
-            except Exception as e:
-                logger.error(f"Error removing key file: {str(e)}")
-            self.key_file = None

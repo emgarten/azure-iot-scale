@@ -1,7 +1,7 @@
 """Locust user for IoT Hub certificate-based device testing.
 
 This module provides a Locust user that manages multiple IoT Hub devices,
-sending messages in a round-robin fashion across all connected devices.
+requesting certificate renewals in a round-robin fashion across all connected devices.
 """
 
 import logging
@@ -30,9 +30,8 @@ from storage import initialize_storage  # noqa: E402
 logger = logging.getLogger("locust.cert_user")
 
 # Environment configuration
-hub_message_interval = int(os.getenv("HUB_MESSAGE_INTERVAL", "5"))  # seconds
+cert_request_interval = int(os.getenv("CERT_REQUEST_INTERVAL", "5"))  # seconds
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
-hub_message_size = int(os.getenv("HUB_MESSAGE_SIZE", "256"))  # bytes
 devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
 
 
@@ -40,16 +39,15 @@ class CertUser(User):
     """Locust user that manages multiple IoT Hub devices.
 
     This user provisions and connects multiple devices (configurable via DEVICES_PER_USER),
-    then sends messages in a round-robin fashion across all connected devices.
+    then requests certificate renewals in a round-robin fashion across all connected devices.
 
     Environment Variables:
         DEVICES_PER_USER: Number of devices per Locust user (default: 1)
-        HUB_MESSAGE_INTERVAL: Seconds between message sends (default: 5)
+        CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 5)
         DEVICE_NAME_PREFIX: Prefix for device names (default: "device-")
-        HUB_MESSAGE_SIZE: Size of message payload in bytes (default: 256)
     """
 
-    wait_time = constant_pacing(hub_message_interval)  # type: ignore[no-untyped-call]
+    wait_time = constant_pacing(cert_request_interval)  # type: ignore[no-untyped-call]
     _device_counter: int = 0  # Class-level counter for unique device numbering
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
 
@@ -121,15 +119,15 @@ class CertUser(User):
         return device
 
     @task
-    def send_message(self) -> None:
-        """Send a message from the next device in round-robin order."""
+    def request_certificate(self) -> None:
+        """Request a certificate renewal from the next device in round-robin order."""
         device = self._get_next_device()
 
         if device is None:
-            logger.warning("No connected devices available, skipping message send")
+            logger.warning("No connected devices available, skipping certificate request")
             return
 
-        device.send_message(hub_message_size)
+        device.request_new_certificate()
 
     def on_stop(self) -> None:
         """Cleanup method called when the user stops."""
