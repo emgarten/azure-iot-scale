@@ -32,6 +32,37 @@ def x509_certificate_list_to_pem(cert_list: list[str]) -> str:
     return begin_cert_header + separator.join(cert_list) + end_cert_footer
 
 
+def parse_request_id_from_topic(topic: str) -> int | None:
+    """Parse the request ID ($rid) from an IoT Hub MQTT topic.
+
+    Extracts the $rid parameter from topics like:
+    - $iothub/credentials/res/202/?$rid=66641568
+    - $iothub/credentials/res/200/?$rid=12345&$version=1
+
+    Args:
+        topic: MQTT topic string
+
+    Returns:
+        The request ID as an integer, or None if not found or invalid.
+    """
+    parts = topic.split("/")
+    if len(parts) < 5:
+        return None
+
+    query_part = parts[4]  # e.g., "?$rid=66641568&$version=1"
+    if query_part.startswith("?"):
+        query_part = query_part[1:]
+
+    for param in query_part.split("&"):
+        if param.startswith("$rid="):
+            try:
+                return int(param[5:])
+            except ValueError:
+                return None
+
+    return None
+
+
 def retry_with_backoff(
     operation_name: str,
     operation_func: Callable[[], Any],
