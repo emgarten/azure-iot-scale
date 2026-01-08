@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 from cryptography.x509.oid import NameOID
 
+from storage import delete_device_data as _delete_device_data
 from storage import load_device_data as _load_device_data
 from storage import save_device_data as _save_device_data
 from utils import parse_request_id_from_topic, retry_with_backoff, x509_certificate_list_to_pem
@@ -311,6 +312,41 @@ class HubCertDevice:
             )
             return None
 
+    def delete_device_data(self) -> None:
+        """Delete device data from Azure Blob Storage with Locust event tracking.
+
+        This method is a no-op if the device data doesn't exist.
+        """
+        start_time = time.time()
+
+        try:
+            _delete_device_data(self.device_name)
+
+            # Fire success event
+            total_time = int((time.time() - start_time) * 1000)
+            self.environment.events.request.fire(
+                request_type="Storage",
+                name="delete_device_data",
+                response_time=total_time,
+                response_length=0,
+                exception=None,
+                context={"device_name": self.device_name, "status": "success"},
+            )
+        except Exception as e:
+            logger.error(f"Failed to delete device data for {self.device_name}: {e}")
+
+            # Fire failure event
+            total_time = int((time.time() - start_time) * 1000)
+            self.environment.events.request.fire(
+                request_type="Storage",
+                name="delete_device_data",
+                response_time=total_time,
+                response_length=0,
+                exception=str(e),
+                context={"device_name": self.device_name, "status": "error"},
+            )
+            # Don't raise - graceful degradation
+
     def _restore_from_storage(self, device_data: dict[str, Any]) -> bool:
         """Restore device state from storage data.
 
@@ -492,10 +528,15 @@ class HubCertDevice:
         """Provision the device with DPS.
 
         This method first tries to load existing registration from storage.
-        If not found, it provisions a new device with DPS using retry logic.
+        If found, it validates the data by attempting to connect to the hub.
+        If the connection fails (e.g., expired certificate), it deletes the
+        bad data and falls back to DPS provisioning.
+
+        After successful DPS provisioning, it also validates by connecting.
+        The connection is kept open for efficiency.
 
         Returns:
-            True if device is successfully provisioned (or loaded from storage),
+            True if device is successfully provisioned and connected,
             False otherwise.
         """
         # Check if a registration result already exists in device data storage
@@ -505,8 +546,23 @@ class HubCertDevice:
             logger.info(f"Loaded existing registration for {self.device_name}")
             if self._restore_from_storage(device_data):
                 if device_data.get("registration_status") == "assigned":
-                    logger.info(f"Using existing registration for {self.device_name}, skipping provisioning")
-                    return True
+                    # Validate the loaded data by attempting to connect
+                    logger.info(f"Validating loaded registration for {self.device_name} by connecting")
+                    if self.connect():
+                        logger.info(f"Using existing registration for {self.device_name}, connection verified")
+                        # Keep connection open for efficiency
+                        return True
+                    else:
+                        # Connection failed - certificate may be expired or invalid
+                        logger.warning(
+                            f"Failed to connect with loaded registration for {self.device_name}, "
+                            "deleting bad data and re-provisioning"
+                        )
+                        self.delete_device_data()
+                        # Clear the restored state so we can re-provision
+                        self.registration_result = None
+                        self.private_key = None
+                        self.issued_cert_data = ""
 
         # Provision with DPS (with retry logic)
         try:
@@ -520,7 +576,21 @@ class HubCertDevice:
             logger.error(f"Provisioning failed for {self.device_name}: {e}")
             return False
 
-        return self.registration_result is not None and self.registration_result.status == "assigned"
+        # Check if provisioning was successful
+        if self.registration_result is None or self.registration_result.status != "assigned":
+            return False
+
+        # Validate the newly provisioned data by attempting to connect
+        logger.info(f"Validating new provisioning for {self.device_name} by connecting")
+        if self.connect():
+            logger.info(f"New provisioning for {self.device_name} validated, connection established")
+            # Keep connection open for efficiency
+            return True
+        else:
+            # Connection failed after provisioning - delete the saved data
+            logger.error(f"Failed to connect after provisioning {self.device_name}, deleting saved data")
+            self.delete_device_data()
+            return False
 
     def disconnect(self) -> None:
         """Disconnect from IoT Hub and clean up resources."""
