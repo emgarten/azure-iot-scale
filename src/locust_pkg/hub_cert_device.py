@@ -989,6 +989,12 @@ class HubCertDevice:
             logger.debug(f"Sending credential request to {publish_topic}")
             # At this point client is guaranteed to be non-None (checked above)
             assert self.client is not None
+
+            # Always re-subscribe before publishing to ensure subscription is active
+            # (subscriptions are idempotent - subscribing twice is harmless)
+            subscribe_topic = "$iothub/credentials/res/#"
+            self.client.subscribe(subscribe_topic, qos=1)
+
             result = self.client.publish(publish_topic, payload=payload, qos=1)
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise Exception(f"Failed to publish CSR request: {result.rc}")
