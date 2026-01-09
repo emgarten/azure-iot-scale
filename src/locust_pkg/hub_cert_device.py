@@ -776,7 +776,7 @@ class HubCertDevice:
             if request_id is not None and request_id in self.pending_requests:
                 del self.pending_requests[request_id]
 
-    def connect(self) -> bool:
+    def connect(self, _retry_from_storage: bool = False) -> bool:
         """Connect to IoT Hub via Paho MQTT.
 
         This method establishes a persistent MQTT connection and subscribes to the
@@ -785,6 +785,14 @@ class HubCertDevice:
 
         If called when already connected, it verifies the connection is still active.
         If the connection was lost, it will clean up and reconnect.
+
+        If a KEY_VALUES_MISMATCH error occurs (certificate/key mismatch), this method
+        will automatically reload credentials from storage and retry once. This handles
+        race conditions where in-memory state got out of sync with storage.
+
+        Args:
+            _retry_from_storage: Internal flag to prevent infinite retry loops.
+                Do not set this manually.
 
         Returns:
             True if connection and subscription were successful, False otherwise.
@@ -899,6 +907,28 @@ class HubCertDevice:
 
             # Clean up on failure
             self._disconnect()
+
+            # Handle KEY_VALUES_MISMATCH error by reloading from storage and retrying once
+            # This handles race conditions where in-memory state got out of sync with storage
+            error_str = str(e)
+            if "KEY_VALUES_MISMATCH" in error_str and not _retry_from_storage:
+                logger.warning(
+                    f"Key/certificate mismatch for {self.device_name}, " "reloading from storage and retrying"
+                )
+                # Clear in-memory state
+                self.registration_result = None
+                self.private_key = None
+                self.issued_cert_data = ""
+
+                # Reload from storage
+                device_data = self.load_device_data()
+                if device_data is not None and self._restore_from_storage(device_data):
+                    logger.info(f"Reloaded credentials from storage for {self.device_name}, retrying connect")
+                    # Retry connection with reloaded data (only once)
+                    return self.connect(_retry_from_storage=True)
+                else:
+                    logger.error(f"Failed to reload credentials from storage for {self.device_name}")
+
             return False
 
     def get_time_since_last_cert_response(self) -> Optional[float]:
