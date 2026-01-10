@@ -524,13 +524,47 @@ class HubCertDevice:
             # Re-raise to trigger retry
             raise
 
+    def _connect_with_retry(self, max_attempts: int = 3, base_wait: int = 30, max_jitter: int = 15) -> bool:
+        """Attempt to connect with retry logic.
+
+        This method wraps the connect() method with retry logic to handle
+        transient connection failures. It will retry multiple times before
+        giving up.
+
+        Args:
+            max_attempts: Maximum number of connection attempts (default: 3)
+            base_wait: Base wait time in seconds between retries (default: 30)
+            max_jitter: Maximum random jitter in seconds to add to wait time (default: 15)
+
+        Returns:
+            True if connection was successful, False after all retries exhausted.
+        """
+        for attempt in range(1, max_attempts + 1):
+            if self.connect():
+                if attempt > 1:
+                    logger.info(f"Connection succeeded on attempt {attempt} for {self.device_name}")
+                return True
+
+            if attempt < max_attempts:
+                jitter = random.uniform(0, max_jitter)
+                wait_time = base_wait + jitter
+                logger.warning(
+                    f"Connection attempt {attempt}/{max_attempts} failed for {self.device_name}, "
+                    f"retrying in {wait_time:.1f}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                logger.error(f"All {max_attempts} connection attempts failed for {self.device_name}")
+
+        return False
+
     def provision(self) -> bool:
         """Provision the device with DPS.
 
         This method first tries to load existing registration from storage.
         If found, it validates the data by attempting to connect to the hub.
-        If the connection fails (e.g., expired certificate), it deletes the
-        bad data and falls back to DPS provisioning.
+        If the connection fails after multiple retries (e.g., expired certificate),
+        it deletes the bad data and falls back to DPS provisioning.
 
         After successful DPS provisioning, it also validates by connecting.
         The connection is kept open for efficiency.
@@ -546,16 +580,16 @@ class HubCertDevice:
             logger.info(f"Loaded existing registration for {self.device_name}")
             if self._restore_from_storage(device_data):
                 if device_data.get("registration_status") == "assigned":
-                    # Validate the loaded data by attempting to connect
+                    # Validate the loaded data by attempting to connect (with retries)
                     logger.info(f"Validating loaded registration for {self.device_name} by connecting")
-                    if self.connect():
+                    if self._connect_with_retry():
                         logger.info(f"Using existing registration for {self.device_name}, connection verified")
                         # Keep connection open for efficiency
                         return True
                     else:
-                        # Connection failed - certificate may be expired or invalid
+                        # Connection failed after retries - certificate may be expired or invalid
                         logger.warning(
-                            f"Failed to connect with loaded registration for {self.device_name}, "
+                            f"Failed to connect with loaded registration for {self.device_name} after retries, "
                             "deleting bad data and re-provisioning"
                         )
                         self.delete_device_data()
@@ -580,15 +614,17 @@ class HubCertDevice:
         if self.registration_result is None or self.registration_result.status != "assigned":
             return False
 
-        # Validate the newly provisioned data by attempting to connect
+        # Validate the newly provisioned data by attempting to connect (with retries)
         logger.info(f"Validating new provisioning for {self.device_name} by connecting")
-        if self.connect():
+        if self._connect_with_retry():
             logger.info(f"New provisioning for {self.device_name} validated, connection established")
             # Keep connection open for efficiency
             return True
         else:
-            # Connection failed after provisioning - delete the saved data
-            logger.error(f"Failed to connect after provisioning {self.device_name}, deleting saved data")
+            # Connection failed after provisioning and retries - delete the saved data
+            logger.error(
+                f"Failed to connect after provisioning {self.device_name} (after retries), deleting saved data"
+            )
             self.delete_device_data()
             return False
 
