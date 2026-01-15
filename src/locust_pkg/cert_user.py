@@ -47,7 +47,7 @@ class CertUser(User):
         CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 90)
         DEVICE_NAME_PREFIX: Prefix for device names (default: "device-")
         CERT_REPLACE_ENABLED: Enable certificate replacement mode (default: "false")
-        DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 100000)
+        DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 2500)
         LOAD_TEST_RUN_ID: Automatically set by Azure Load Test
         RUN_ID: Manual run ID (fallback if LOAD_TEST_RUN_ID is not set)
     """
