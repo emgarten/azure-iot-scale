@@ -88,7 +88,9 @@ class HubCertDevice:
         """
         self.device_name = device_name
         self.environment = environment
-        self.private_key: Optional[EllipticCurvePrivateKey] = None
+        # Generate the private key once at instance creation to ensure CSR consistency
+        # (allows server-side CSR hash caching)
+        self.private_key: EllipticCurvePrivateKey = ec.generate_private_key(ec.SECP256R1())
         self.issued_cert_data: str = ""
         self.registration_result: Optional[RegistrationResult] = None
 
@@ -416,10 +418,7 @@ class HubCertDevice:
                     "Either provide PROVISIONING_X509_CERT_FILE and PROVISIONING_X509_KEY_FILE or PROVISIONING_SAS_KEY"
                 )
 
-            # Generate EC private key (prime256v1 = SECP256R1)
-            self.private_key = ec.generate_private_key(ec.SECP256R1())
-
-            # Generate CSR (Certificate Signing Request)
+            # Generate CSR (Certificate Signing Request) using the existing private key
             csr_builder = x509.CertificateSigningRequestBuilder()
             csr_builder = csr_builder.subject_name(
                 x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.device_name)])
@@ -594,8 +593,8 @@ class HubCertDevice:
                         )
                         self.delete_device_data()
                         # Clear the restored state so we can re-provision
+                        # Note: Keep private_key intact to maintain CSR consistency
                         self.registration_result = None
-                        self.private_key = None
                         self.issued_cert_data = ""
 
         # Provision with DPS (with retry logic)
@@ -665,13 +664,7 @@ class HubCertDevice:
 
         Returns:
             Base64-encoded DER format CSR string.
-
-        Raises:
-            Exception: If no private key is available.
         """
-        if self.private_key is None:
-            raise Exception("Cannot create CSR: no private key available")
-
         csr_builder = x509.CertificateSigningRequestBuilder()
         csr_builder = csr_builder.subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.device_name)]))
         csr = csr_builder.sign(self.private_key, hashes.SHA256())
@@ -847,8 +840,8 @@ class HubCertDevice:
             logger.error("Cannot connect: no registration result")
             return False
 
-        if self.private_key is None or not self.issued_cert_data:
-            logger.error("Cannot connect: missing private key or certificate")
+        if not self.issued_cert_data:
+            logger.error("Cannot connect: missing certificate")
             return False
 
         hostname = self.registration_result.registration_state.assigned_hub
@@ -951,9 +944,8 @@ class HubCertDevice:
                 logger.warning(
                     f"Key/certificate mismatch for {self.device_name}, " "reloading from storage and retrying"
                 )
-                # Clear in-memory state
+                # Clear in-memory state (keep private_key to maintain CSR consistency)
                 self.registration_result = None
-                self.private_key = None
                 self.issued_cert_data = ""
 
                 # Reload from storage
@@ -1003,18 +995,6 @@ class HubCertDevice:
                 response_time=0,
                 response_length=0,
                 exception="No registration result",
-                context={"device_name": self.device_name, "status": "error"},
-            )
-            return False
-
-        if self.private_key is None:
-            logger.error("Cannot request new certificate: no private key")
-            self.environment.events.request.fire(
-                request_type="Hub",
-                name="credential_request",
-                response_time=0,
-                response_length=0,
-                exception="No private key",
                 context={"device_name": self.device_name, "status": "error"},
             )
             return False
