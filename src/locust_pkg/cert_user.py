@@ -58,6 +58,7 @@ class CertUser(User):
         """Generate a unique device name using the prefix and an incrementing counter."""
         device_name = f"{device_name_prefix}{cls._device_counter}"
         cls._device_counter += 1
+        logger.info(f"Generated device name: {device_name}")
         return device_name
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
