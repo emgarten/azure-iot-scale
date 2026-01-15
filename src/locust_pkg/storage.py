@@ -1,8 +1,12 @@
 import logging
 import os
+import random
+import time
 from typing import Any, Optional
 
 import orjson
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.core.match_conditions import MatchConditions
 from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -18,9 +22,13 @@ storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
 storage_container_name = os.getenv("STORAGE_CONTAINER_NAME", "scale")
 counter_blob_prefix = os.getenv("COUNTER_BLOB_PREFIX", "counter")
 device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
+device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "2500"))
 
 # Global BlobServiceClient singleton
 _blob_service_client: Optional[BlobServiceClient] = None
+
+# Global run ID (cached after first computation)
+_cached_run_id: Optional[str] = None
 
 
 def get_blob_service_client() -> BlobServiceClient:
@@ -43,6 +51,35 @@ def get_blob_service_client() -> BlobServiceClient:
             raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
 
     return _blob_service_client
+
+
+def get_run_id() -> str:
+    """Get the run ID for this test run.
+
+    The run ID is used to isolate device ID counters between test runs.
+    It is computed once and cached for the lifetime of the process.
+
+    Uses LOAD_TEST_RUN_ID (automatically set by Azure Load Test),
+    falling back to RUN_ID environment variable.
+
+    Returns:
+        str: The run ID for this test run.
+
+    Raises:
+        Exception: If neither LOAD_TEST_RUN_ID nor RUN_ID is set.
+    """
+    global _cached_run_id
+
+    if _cached_run_id is not None:
+        return _cached_run_id
+
+    run_id = os.getenv("LOAD_TEST_RUN_ID") or os.getenv("RUN_ID")
+    if not run_id:
+        raise Exception("Missing LOAD_TEST_RUN_ID or RUN_ID environment variable")
+
+    _cached_run_id = run_id
+    logger.info(f"Using run ID: {_cached_run_id}")
+    return _cached_run_id
 
 
 def initialize_storage(blob_service_client: Optional[BlobServiceClient] = None) -> BlobServiceClient:
@@ -185,3 +222,194 @@ def delete_device_data(
             logger.debug(f"Deleted device data for {device_name}")
     except Exception as e:
         logger.error(f"Failed to delete device data for {device_name}: {e}")
+
+
+def allocate_device_id_range(
+    run_id: Optional[str] = None,
+    range_size: Optional[int] = None,
+    blob_service_client: Optional[BlobServiceClient] = None,
+    max_retries: int = 10,
+) -> tuple[int, int]:
+    """Atomically allocate a range of device IDs for a worker.
+
+    This function uses ETag-based optimistic concurrency to safely allocate
+    non-overlapping ID ranges to multiple workers. Each worker gets a unique
+    range of IDs to use locally without further coordination.
+
+    Args:
+        run_id: The run ID to use for isolation. If None, uses get_run_id().
+        range_size: Number of IDs to allocate. If None, uses DEVICE_ID_RANGE_SIZE env var.
+        blob_service_client: Optional blob service client. If None, uses global singleton.
+        max_retries: Maximum number of retries on ETag conflict (default: 10).
+
+    Returns:
+        Tuple of (start_id, end_id) where end_id is exclusive.
+        For example, (0, 1000) means IDs 0-999 are allocated.
+
+    Raises:
+        Exception: If allocation fails after max_retries attempts.
+    """
+    if run_id is None:
+        run_id = get_run_id()
+    if range_size is None:
+        range_size = device_id_range_size
+    if blob_service_client is None:
+        blob_service_client = get_blob_service_client()
+
+    container_client = blob_service_client.get_container_client(storage_container_name)
+    blob_name = f"{counter_blob_prefix}/{run_id}/counter.json"
+    blob_client = container_client.get_blob_client(blob_name)
+
+    for attempt in range(max_retries):
+        try:
+            # Try to read existing counter
+            try:
+                download_result = blob_client.download_blob()
+                blob_data = download_result.readall()
+                counter_data = orjson.loads(blob_data)
+                current_next_id = counter_data.get("next_id", 0)
+                etag = download_result.properties.etag
+            except ResourceNotFoundError:
+                # Blob doesn't exist, start from 0
+                current_next_id = 0
+                etag = None
+
+            # Calculate new range
+            start_id = current_next_id
+            end_id = start_id + range_size
+            new_counter_data = orjson.dumps({"next_id": end_id})
+
+            # Attempt conditional write
+            if etag is None:
+                # Create new blob (will fail if another worker created it first)
+                try:
+                    blob_client.upload_blob(new_counter_data, overwrite=False)
+                except ResourceExistsError:
+                    # Another worker created it, retry
+                    logger.debug(f"Counter blob created by another worker, retrying (attempt {attempt + 1})")
+                    time.sleep(random.uniform(0.1, 0.5))
+                    continue
+            else:
+                # Update existing blob with ETag check
+                try:
+                    blob_client.upload_blob(
+                        new_counter_data,
+                        overwrite=True,
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified,
+                    )
+                except ResourceModifiedError:
+                    # Another worker updated it, retry
+                    logger.debug(f"Counter blob modified by another worker, retrying (attempt {attempt + 1})")
+                    time.sleep(random.uniform(0.1, 0.5))
+                    continue
+
+            # Success!
+            logger.info(f"Allocated device ID range [{start_id}, {end_id}) for run {run_id}")
+            return (start_id, end_id)
+
+        except Exception as e:
+            logger.warning(f"Error allocating device ID range (attempt {attempt + 1}): {e}")
+            time.sleep(random.uniform(0.5, 1.0))
+
+    raise Exception(f"Failed to allocate device ID range after {max_retries} attempts")
+
+
+def clear_device_counter(
+    run_id: Optional[str] = None,
+    blob_service_client: Optional[BlobServiceClient] = None,
+) -> bool:
+    """Clear the device counter for a specific run.
+
+    This deletes the counter blob, effectively resetting the counter to 0
+    for the specified run ID.
+
+    Args:
+        run_id: The run ID to clear. If None, uses get_run_id().
+        blob_service_client: Optional blob service client. If None, uses global singleton.
+
+    Returns:
+        True if the counter was cleared, False if it didn't exist.
+    """
+    if run_id is None:
+        run_id = get_run_id()
+    if blob_service_client is None:
+        blob_service_client = get_blob_service_client()
+
+    try:
+        container_client = blob_service_client.get_container_client(storage_container_name)
+        blob_name = f"{counter_blob_prefix}/{run_id}/counter.json"
+        blob_client = container_client.get_blob_client(blob_name)
+
+        if blob_client.exists():
+            blob_client.delete_blob()
+            logger.info(f"Cleared device counter for run {run_id}")
+            return True
+        else:
+            logger.debug(f"Device counter for run {run_id} does not exist")
+            return False
+
+    except Exception as e:
+        logger.error(f"Failed to clear device counter for run {run_id}: {e}")
+        return False
+
+
+def list_device_counters(
+    blob_service_client: Optional[BlobServiceClient] = None,
+) -> list[str]:
+    """List all run IDs that have device counters.
+
+    Args:
+        blob_service_client: Optional blob service client. If None, uses global singleton.
+
+    Returns:
+        List of run IDs that have counter blobs.
+    """
+    if blob_service_client is None:
+        blob_service_client = get_blob_service_client()
+
+    try:
+        container_client = blob_service_client.get_container_client(storage_container_name)
+        prefix = f"{counter_blob_prefix}/"
+        run_ids = []
+
+        for blob in container_client.list_blobs(name_starts_with=prefix):
+            # Extract run_id from path like "counter/{run_id}/counter.json"
+            parts = blob.name.split("/")
+            if len(parts) >= 2:
+                run_id = parts[1]
+                if run_id not in run_ids:
+                    run_ids.append(run_id)
+
+        return run_ids
+
+    except Exception as e:
+        logger.error(f"Failed to list device counters: {e}")
+        return []
+
+
+def clear_all_device_counters(
+    blob_service_client: Optional[BlobServiceClient] = None,
+) -> int:
+    """Clear all device counters for all runs.
+
+    This is useful for cleanup after testing.
+
+    Args:
+        blob_service_client: Optional blob service client. If None, uses global singleton.
+
+    Returns:
+        Number of counters cleared.
+    """
+    if blob_service_client is None:
+        blob_service_client = get_blob_service_client()
+
+    run_ids = list_device_counters(blob_service_client)
+    cleared_count = 0
+
+    for run_id in run_ids:
+        if clear_device_counter(run_id, blob_service_client):
+            cleared_count += 1
+
+    logger.info(f"Cleared {cleared_count} device counter(s)")
+    return cleared_count

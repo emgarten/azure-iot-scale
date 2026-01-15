@@ -25,7 +25,7 @@ if wheel_path.exists():
     sys.path.insert(0, str(extract_dir))
 
 from hub_cert_device import HubCertDevice  # noqa: E402
-from storage import initialize_storage  # noqa: E402
+from storage import allocate_device_id_range, get_run_id, initialize_storage  # noqa: E402
 
 logger = logging.getLogger("locust.cert_user")
 
@@ -47,17 +47,55 @@ class CertUser(User):
         CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 90)
         DEVICE_NAME_PREFIX: Prefix for device names (default: "device-")
         CERT_REPLACE_ENABLED: Enable certificate replacement mode (default: "false")
+        DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 100000)
+        LOAD_TEST_RUN_ID: Automatically set by Azure Load Test
+        RUN_ID: Manual run ID (fallback if LOAD_TEST_RUN_ID is not set)
     """
 
     wait_time = constant_pacing(cert_request_interval / devices_per_user)  # type: ignore[no-untyped-call]
-    _device_counter: int = 0  # Class-level counter for unique device numbering
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
+
+    # Distributed device ID range allocation (per-worker, shared across all CertUser instances)
+    _id_range_start: int = 0  # Start of allocated range (inclusive)
+    _id_range_end: int = 0  # End of allocated range (exclusive)
+    _id_range_current: int = 0  # Next ID to use within the range
+    _id_range_allocated: bool = False  # Whether a range has been allocated
+
+    @classmethod
+    def _ensure_id_range(cls) -> None:
+        """Ensure an ID range is allocated for this worker.
+
+        This method allocates a new range from Azure Blob Storage if:
+        - No range has been allocated yet, or
+        - The current range is exhausted
+
+        The allocation is atomic and uses ETag-based optimistic concurrency
+        to ensure non-overlapping ranges across all workers.
+        """
+        if cls._id_range_current >= cls._id_range_end:
+            run_id = get_run_id()
+            logger.info(f"Allocating new device ID range for run {run_id}")
+            cls._id_range_start, cls._id_range_end = allocate_device_id_range(run_id)
+            cls._id_range_current = cls._id_range_start
+            cls._id_range_allocated = True
+            logger.info(f"Allocated device ID range [{cls._id_range_start}, {cls._id_range_end})")
 
     @classmethod
     def get_device_name(cls) -> str:
-        """Generate a unique device name using the prefix and an incrementing counter."""
-        device_name = f"{device_name_prefix}{cls._device_counter}"
-        cls._device_counter += 1
+        """Generate a unique device name using the prefix and a distributed counter.
+
+        This method ensures device names are unique across all workers by:
+        1. Allocating non-overlapping ID ranges from Azure Blob Storage
+        2. Using IDs from the allocated range locally without coordination
+        3. Automatically allocating a new range when the current one is exhausted
+
+        Returns:
+            A unique device name in the format "{prefix}{id}"
+        """
+        cls._ensure_id_range()
+        device_id = cls._id_range_current
+        cls._id_range_current += 1
+        device_name = f"{device_name_prefix}{device_id}"
         logger.info(f"Generated device name: {device_name}")
         return device_name
 
