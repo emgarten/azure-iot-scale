@@ -5,8 +5,8 @@ import time
 from typing import Any, Optional
 
 import orjson
+from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
-from azure.core.match_conditions import MatchConditions
 from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
