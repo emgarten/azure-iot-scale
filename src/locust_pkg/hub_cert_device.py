@@ -15,7 +15,9 @@ import os
 import random
 import ssl
 import tempfile
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
@@ -103,11 +105,14 @@ class HubCertDevice:
         # Track last certificate chain response time (ticks from time.time())
         self.last_cert_chain_response_time: Optional[float] = None
 
-        # Track pending requests: request_id -> send_time (ticks from time.time())
-        self.pending_requests: dict[int, float] = {}
+        # Track pending requests: request_id (UUID string) -> send_time (ticks from time.time())
+        self.pending_requests: dict[str, float] = {}
 
         # Track disconnect reason for debugging
         self._last_disconnect_rc: Optional[int] = None
+
+        # Event for connection synchronization (replaces busy-wait loop)
+        self._connect_event: threading.Event = threading.Event()
 
     def _is_actually_connected(self) -> bool:
         """Check if MQTT client is actually connected.
@@ -171,6 +176,7 @@ class HubCertDevice:
         if rc == 0:
             self.is_connected = True
             self._last_disconnect_rc = None
+            self._connect_event.set()  # Signal successful connection
             logger.info(f"MQTT connected for {self.device_name}")
         else:
             self.is_connected = False
@@ -523,22 +529,40 @@ class HubCertDevice:
             # Re-raise to trigger retry
             raise
 
-    def _connect_with_retry(self, max_attempts: int = 3, base_wait: int = 30, max_jitter: int = 15) -> bool:
-        """Attempt to connect with retry logic.
+    def _connect_with_retry(
+        self,
+        max_attempts: int = 3,
+        base_wait: int = 30,
+        max_jitter: int = 15,
+        total_timeout: float = 300,
+    ) -> bool:
+        """Attempt to connect with retry logic and total timeout.
 
         This method wraps the connect() method with retry logic to handle
         transient connection failures. It will retry multiple times before
-        giving up.
+        giving up, but will also respect a total timeout to prevent blocking
+        indefinitely.
 
         Args:
             max_attempts: Maximum number of connection attempts (default: 3)
             base_wait: Base wait time in seconds between retries (default: 30)
             max_jitter: Maximum random jitter in seconds to add to wait time (default: 15)
+            total_timeout: Maximum total time in seconds before giving up (default: 300 = 5 minutes)
 
         Returns:
-            True if connection was successful, False after all retries exhausted.
+            True if connection was successful, False after all retries exhausted or timeout.
         """
+        start_time = time.time()
+
         for attempt in range(1, max_attempts + 1):
+            # Check if we've exceeded total timeout before attempting
+            elapsed = time.time() - start_time
+            if elapsed >= total_timeout:
+                logger.warning(
+                    f"Connection timed out after {elapsed:.1f}s for {self.device_name} " f"(before attempt {attempt})"
+                )
+                return False
+
             if self.connect():
                 if attempt > 1:
                     logger.info(f"Connection succeeded on attempt {attempt} for {self.device_name}")
@@ -547,6 +571,15 @@ class HubCertDevice:
             if attempt < max_attempts:
                 jitter = random.uniform(0, max_jitter)
                 wait_time = base_wait + jitter
+
+                # Check if waiting would exceed total timeout
+                elapsed = time.time() - start_time
+                if (elapsed + wait_time) >= total_timeout:
+                    logger.warning(
+                        f"Connection timed out after {elapsed:.1f}s for {self.device_name} " f"({attempt} attempts)"
+                    )
+                    return False
+
                 logger.warning(
                     f"Connection attempt {attempt}/{max_attempts} failed for {self.device_name}, "
                     f"retrying in {wait_time:.1f}s..."
@@ -597,14 +630,18 @@ class HubCertDevice:
                         self.registration_result = None
                         self.issued_cert_data = ""
 
-        # Provision with DPS (with retry logic)
+        # Provision with DPS (with retry logic, max 5 minutes)
         try:
             retry_with_backoff(
                 operation_name=f"provision_device({self.device_name})",
                 operation_func=self._provision_inner,
                 base_wait=60,
                 max_jitter=30,
+                max_timeout=300,  # 5 minutes max
             )
+        except TimeoutError as e:
+            logger.warning(f"Provisioning timed out for {self.device_name}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Provisioning failed for {self.device_name}: {e}")
             return False
@@ -888,17 +925,14 @@ class HubCertDevice:
 
             # Connect to IoT Hub
             logger.debug(f"Connecting to {hostname} via MQTT")
+            self._connect_event.clear()  # Reset event before connection attempt
             self.client.connect(hostname, MQTT_PORT, keepalive=60)
             self.client.loop_start()
 
-            # Wait for connection
+            # Wait for connection using event-based synchronization (avoids busy-wait)
             connect_timeout = 120
-            connect_start = time.time()
-            while not self.client.is_connected() and (time.time() - connect_start) < connect_timeout:
-                time.sleep(0.1)
-
-            if not self.client.is_connected():
-                raise Exception("Failed to connect to IoT Hub via MQTT")
+            if not self._connect_event.wait(timeout=connect_timeout):
+                raise Exception("Failed to connect to IoT Hub via MQTT (timeout)")
 
             # Subscribe to response topic (once, for the lifetime of the connection)
             subscribe_topic = "$iothub/credentials/res/#"
@@ -1025,7 +1059,7 @@ class HubCertDevice:
         try:
             # Create CSR and publish request
             csr_data = self._create_csr()
-            request_id = random.randint(1, 99999999)
+            request_id = str(uuid.uuid4())
             publish_topic = f"$iothub/credentials/POST/issueCertificate/?$rid={request_id}"
             payload_dict: dict[str, str] = {"id": device_id, "csr": csr_data}
             if replace:

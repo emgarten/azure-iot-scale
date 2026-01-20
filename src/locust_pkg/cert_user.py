@@ -8,11 +8,12 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any
 
-from locust import User, constant_pacing, task
+from locust import User, constant_pacing, events, task
 
 # Load the azure-iot-device wheel if present
 wheel_path = Path("azure_iot_device-2.14.0-py3-none-any.whl")
@@ -25,13 +26,21 @@ if wheel_path.exists():
     sys.path.insert(0, str(extract_dir))
 
 from hub_cert_device import HubCertDevice  # noqa: E402
-from storage import allocate_device_id_range, get_run_id, initialize_storage  # noqa: E402
+from storage import allocate_device_id_range, clear_device_counter, initialize_storage  # noqa: E402
 
 logger = logging.getLogger("locust.cert_user")
 
+
+@events.test_stop.add_listener  # type: ignore[misc]
+def on_test_stop(environment: Any, **kwargs: Any) -> None:
+    """Clean up the device counter blob when the test stops."""
+    logger.info("Test stopping, cleaning up device counter")
+    clear_device_counter()
+
+
 # Environment configuration
 cert_request_interval = int(os.getenv("CERT_REQUEST_INTERVAL", "90"))  # seconds
-device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device-")
+device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
 cert_replace_enabled = os.getenv("CERT_REPLACE_ENABLED", "false").lower() == "true"
 
@@ -45,25 +54,24 @@ class CertUser(User):
     Environment Variables:
         DEVICES_PER_USER: Number of devices per Locust user (default: 1)
         CERT_REQUEST_INTERVAL: Seconds between certificate requests (default: 90)
-        DEVICE_NAME_PREFIX: Prefix for device names (default: "device-")
+        DEVICE_NAME_PREFIX: Prefix for device names (default: "device"), also used for counter isolation
         CERT_REPLACE_ENABLED: Enable certificate replacement mode (default: "false")
         DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 2500)
-        LOAD_TEST_RUN_ID: Automatically set by Azure Load Test
-        RUN_ID: Manual run ID (fallback if LOAD_TEST_RUN_ID is not set)
     """
 
     wait_time = constant_pacing(cert_request_interval / devices_per_user)  # type: ignore[no-untyped-call]
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
 
     # Distributed device ID range allocation (per-worker, shared across all CertUser instances)
+    _id_range_lock: threading.Lock = threading.Lock()  # Lock for thread-safe ID range allocation
     _id_range_start: int = 0  # Start of allocated range (inclusive)
     _id_range_end: int = 0  # End of allocated range (exclusive)
     _id_range_current: int = 0  # Next ID to use within the range
     _id_range_allocated: bool = False  # Whether a range has been allocated
 
     @classmethod
-    def _ensure_id_range(cls) -> None:
-        """Ensure an ID range is allocated for this worker.
+    def _ensure_id_range_unlocked(cls) -> None:
+        """Ensure an ID range is allocated for this worker (must hold _id_range_lock).
 
         This method allocates a new range from Azure Blob Storage if:
         - No range has been allocated yet, or
@@ -71,11 +79,12 @@ class CertUser(User):
 
         The allocation is atomic and uses ETag-based optimistic concurrency
         to ensure non-overlapping ranges across all workers.
+
+        Note: Caller must hold _id_range_lock before calling this method.
         """
         if cls._id_range_current >= cls._id_range_end:
-            run_id = get_run_id()
-            logger.info(f"Allocating new device ID range for run {run_id}")
-            cls._id_range_start, cls._id_range_end = allocate_device_id_range(run_id)
+            logger.info(f"Allocating new device ID range for prefix '{device_name_prefix}'")
+            cls._id_range_start, cls._id_range_end = allocate_device_id_range(device_name_prefix)
             cls._id_range_current = cls._id_range_start
             cls._id_range_allocated = True
             logger.info(f"Allocated device ID range [{cls._id_range_start}, {cls._id_range_end})")
@@ -89,12 +98,15 @@ class CertUser(User):
         2. Using IDs from the allocated range locally without coordination
         3. Automatically allocating a new range when the current one is exhausted
 
+        Thread-safe: Uses a lock to prevent concurrent access from multiple threads.
+
         Returns:
             A unique device name in the format "{prefix}{id}"
         """
-        cls._ensure_id_range()
-        device_id = cls._id_range_current
-        cls._id_range_current += 1
+        with cls._id_range_lock:
+            cls._ensure_id_range_unlocked()
+            device_id = cls._id_range_current
+            cls._id_range_current += 1
         device_name = f"{device_name_prefix}{device_id}"
         logger.info(f"Generated device name: {device_name}")
         return device_name

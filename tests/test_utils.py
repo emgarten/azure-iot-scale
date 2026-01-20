@@ -251,19 +251,19 @@ class TestParseRequestIdFromTopic:
         """Test parsing a valid topic with $rid parameter."""
         topic = "$iothub/credentials/res/202/?$rid=66641568"
         result = parse_request_id_from_topic(topic)
-        assert result == 66641568
+        assert result == "66641568"
 
     def test_valid_topic_with_rid_and_version(self) -> None:
         """Test parsing a topic with $rid and other parameters."""
         topic = "$iothub/credentials/res/200/?$rid=12345&$version=1"
         result = parse_request_id_from_topic(topic)
-        assert result == 12345
+        assert result == "12345"
 
     def test_topic_with_rid_not_first_param(self) -> None:
         """Test parsing when $rid is not the first query parameter."""
         topic = "$iothub/credentials/res/200/?$version=1&$rid=99999"
         result = parse_request_id_from_topic(topic)
-        assert result == 99999
+        assert result == "99999"
 
     def test_topic_without_rid(self) -> None:
         """Test parsing a topic without $rid parameter."""
@@ -283,11 +283,11 @@ class TestParseRequestIdFromTopic:
         result = parse_request_id_from_topic(topic)
         assert result is None
 
-    def test_topic_with_invalid_rid_value(self) -> None:
-        """Test parsing a topic with non-integer $rid value."""
-        topic = "$iothub/credentials/res/202/?$rid=invalid"
+    def test_topic_with_uuid_rid_value(self) -> None:
+        """Test parsing a topic with UUID $rid value."""
+        topic = "$iothub/credentials/res/202/?$rid=550e8400-e29b-41d4-a716-446655440000"
         result = parse_request_id_from_topic(topic)
-        assert result is None
+        assert result == "550e8400-e29b-41d4-a716-446655440000"
 
     def test_topic_with_empty_rid_value(self) -> None:
         """Test parsing a topic with empty $rid value."""
@@ -311,16 +311,16 @@ class TestParseRequestIdFromTopic:
         """Test parsing a topic with a large request ID."""
         topic = "$iothub/credentials/res/200/?$rid=99999999"
         result = parse_request_id_from_topic(topic)
-        assert result == 99999999
+        assert result == "99999999"
 
     def test_topic_with_rid_value_one(self) -> None:
         """Test parsing a topic with request ID of 1."""
         topic = "$iothub/credentials/res/202/?$rid=1"
         result = parse_request_id_from_topic(topic)
-        assert result == 1
+        assert result == "1"
 
     def test_topic_with_multiple_query_params(self) -> None:
         """Test parsing a topic with many query parameters."""
         topic = "$iothub/credentials/res/200/?foo=bar&$rid=54321&$version=2&other=value"
         result = parse_request_id_from_topic(topic)
-        assert result == 54321
+        assert result == "54321"

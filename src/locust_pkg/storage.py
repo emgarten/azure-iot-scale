@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import threading
 import time
 from typing import Any, Optional
 
@@ -23,63 +24,41 @@ storage_container_name = os.getenv("STORAGE_CONTAINER_NAME", "scale")
 counter_blob_prefix = os.getenv("COUNTER_BLOB_PREFIX", "counter")
 device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
 device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "2500"))
+device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 
-# Global BlobServiceClient singleton
+# Global BlobServiceClient singleton with thread-safe initialization
 _blob_service_client: Optional[BlobServiceClient] = None
-
-# Global run ID (cached after first computation)
-_cached_run_id: Optional[str] = None
+_blob_service_client_lock: threading.Lock = threading.Lock()
 
 
 def get_blob_service_client() -> BlobServiceClient:
     """Get or create the global BlobServiceClient singleton.
+
+    Thread-safe: Uses double-checked locking pattern for efficient singleton initialization.
 
     Returns:
         BlobServiceClient: The global blob service client instance.
     """
     global _blob_service_client
 
-    if _blob_service_client is None:
-        if storage_conn_str is not None:
-            _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
-        elif storage_account_url is not None:
-            # Try Azure CLI first (fast for local dev), then fall back to DefaultAzureCredential
-            # (which includes ManagedIdentity, environment vars, etc. for cloud environments)
-            credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
-            _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
-        else:
-            raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
+    # Fast path: if already initialized, return immediately
+    if _blob_service_client is not None:
+        return _blob_service_client
+
+    # Slow path: acquire lock and check again (double-checked locking)
+    with _blob_service_client_lock:
+        if _blob_service_client is None:
+            if storage_conn_str is not None:
+                _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
+            elif storage_account_url is not None:
+                # Try Azure CLI first (fast for local dev), then fall back to DefaultAzureCredential
+                # (which includes ManagedIdentity, environment vars, etc. for cloud environments)
+                credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
+                _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
+            else:
+                raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
 
     return _blob_service_client
-
-
-def get_run_id() -> str:
-    """Get the run ID for this test run.
-
-    The run ID is used to isolate device ID counters between test runs.
-    It is computed once and cached for the lifetime of the process.
-
-    Uses LOAD_TEST_RUN_ID (automatically set by Azure Load Test),
-    falling back to RUN_ID environment variable.
-
-    Returns:
-        str: The run ID for this test run.
-
-    Raises:
-        Exception: If neither LOAD_TEST_RUN_ID nor RUN_ID is set.
-    """
-    global _cached_run_id
-
-    if _cached_run_id is not None:
-        return _cached_run_id
-
-    run_id = os.getenv("LOAD_TEST_RUN_ID") or os.getenv("RUN_ID")
-    if not run_id:
-        raise Exception("Missing LOAD_TEST_RUN_ID or RUN_ID environment variable")
-
-    _cached_run_id = run_id
-    logger.info(f"Using run ID: {_cached_run_id}")
-    return _cached_run_id
 
 
 def initialize_storage(blob_service_client: Optional[BlobServiceClient] = None) -> BlobServiceClient:
@@ -102,12 +81,11 @@ def initialize_storage(blob_service_client: Optional[BlobServiceClient] = None) 
         container_client = blob_service_client.get_container_client(storage_container_name)
         container_client.create_container()
         logger.info(f"Created storage container: {storage_container_name}")
+    except ResourceExistsError:
+        # Container already exists, which is fine
+        logger.debug(f"Storage container already exists: {storage_container_name}")
     except Exception as e:
-        # Container might already exist, which is fine
-        if "ContainerAlreadyExists" in str(e) or "The specified container already exists" in str(e):
-            logger.debug(f"Storage container already exists: {storage_container_name}")
-        else:
-            logger.warning(f"Error creating storage container {storage_container_name}: {e}")
+        logger.warning(f"Error creating storage container {storage_container_name}: {e}")
 
     return blob_service_client
 
@@ -225,7 +203,7 @@ def delete_device_data(
 
 
 def allocate_device_id_range(
-    run_id: Optional[str] = None,
+    device_prefix: Optional[str] = None,
     range_size: Optional[int] = None,
     blob_service_client: Optional[BlobServiceClient] = None,
     max_retries: int = 10,
@@ -237,7 +215,7 @@ def allocate_device_id_range(
     range of IDs to use locally without further coordination.
 
     Args:
-        run_id: The run ID to use for isolation. If None, uses get_run_id().
+        device_prefix: The device name prefix to use for isolation. If None, uses DEVICE_NAME_PREFIX.
         range_size: Number of IDs to allocate. If None, uses DEVICE_ID_RANGE_SIZE env var.
         blob_service_client: Optional blob service client. If None, uses global singleton.
         max_retries: Maximum number of retries on ETag conflict (default: 10).
@@ -249,15 +227,15 @@ def allocate_device_id_range(
     Raises:
         Exception: If allocation fails after max_retries attempts.
     """
-    if run_id is None:
-        run_id = get_run_id()
+    if device_prefix is None:
+        device_prefix = device_name_prefix
     if range_size is None:
         range_size = device_id_range_size
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
 
     container_client = blob_service_client.get_container_client(storage_container_name)
-    blob_name = f"{counter_blob_prefix}/{run_id}/counter.json"
+    blob_name = f"{counter_blob_prefix}/{device_prefix}/counter.json"
     blob_client = container_client.get_blob_client(blob_name)
 
     for attempt in range(max_retries):
@@ -305,7 +283,7 @@ def allocate_device_id_range(
                     continue
 
             # Success!
-            logger.info(f"Allocated device ID range [{start_id}, {end_id}) for run {run_id}")
+            logger.info(f"Allocated device ID range [{start_id}, {end_id}) for prefix '{device_prefix}'")
             return (start_id, end_id)
 
         except Exception as e:
@@ -316,54 +294,54 @@ def allocate_device_id_range(
 
 
 def clear_device_counter(
-    run_id: Optional[str] = None,
+    device_prefix: Optional[str] = None,
     blob_service_client: Optional[BlobServiceClient] = None,
 ) -> bool:
-    """Clear the device counter for a specific run.
+    """Clear the device counter for a specific device prefix.
 
     This deletes the counter blob, effectively resetting the counter to 0
-    for the specified run ID.
+    for the specified device prefix.
 
     Args:
-        run_id: The run ID to clear. If None, uses get_run_id().
+        device_prefix: The device name prefix to clear. If None, uses DEVICE_NAME_PREFIX.
         blob_service_client: Optional blob service client. If None, uses global singleton.
 
     Returns:
         True if the counter was cleared, False if it didn't exist.
     """
-    if run_id is None:
-        run_id = get_run_id()
+    if device_prefix is None:
+        device_prefix = device_name_prefix
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
 
     try:
         container_client = blob_service_client.get_container_client(storage_container_name)
-        blob_name = f"{counter_blob_prefix}/{run_id}/counter.json"
+        blob_name = f"{counter_blob_prefix}/{device_prefix}/counter.json"
         blob_client = container_client.get_blob_client(blob_name)
 
         if blob_client.exists():
             blob_client.delete_blob()
-            logger.info(f"Cleared device counter for run {run_id}")
+            logger.info(f"Cleared device counter for prefix '{device_prefix}'")
             return True
         else:
-            logger.debug(f"Device counter for run {run_id} does not exist")
+            logger.debug(f"Device counter for prefix '{device_prefix}' does not exist")
             return False
 
     except Exception as e:
-        logger.error(f"Failed to clear device counter for run {run_id}: {e}")
+        logger.error(f"Failed to clear device counter for prefix '{device_prefix}': {e}")
         return False
 
 
 def list_device_counters(
     blob_service_client: Optional[BlobServiceClient] = None,
 ) -> list[str]:
-    """List all run IDs that have device counters.
+    """List all device prefixes that have device counters.
 
     Args:
         blob_service_client: Optional blob service client. If None, uses global singleton.
 
     Returns:
-        List of run IDs that have counter blobs.
+        List of device prefixes that have counter blobs.
     """
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
@@ -371,17 +349,17 @@ def list_device_counters(
     try:
         container_client = blob_service_client.get_container_client(storage_container_name)
         prefix = f"{counter_blob_prefix}/"
-        run_ids = []
+        device_prefixes = []
 
         for blob in container_client.list_blobs(name_starts_with=prefix):
-            # Extract run_id from path like "counter/{run_id}/counter.json"
+            # Extract device_prefix from path like "counter/{device_prefix}/counter.json"
             parts = blob.name.split("/")
             if len(parts) >= 2:
-                run_id = parts[1]
-                if run_id not in run_ids:
-                    run_ids.append(run_id)
+                device_prefix = parts[1]
+                if device_prefix not in device_prefixes:
+                    device_prefixes.append(device_prefix)
 
-        return run_ids
+        return device_prefixes
 
     except Exception as e:
         logger.error(f"Failed to list device counters: {e}")
@@ -391,7 +369,7 @@ def list_device_counters(
 def clear_all_device_counters(
     blob_service_client: Optional[BlobServiceClient] = None,
 ) -> int:
-    """Clear all device counters for all runs.
+    """Clear all device counters for all device prefixes.
 
     This is useful for cleanup after testing.
 
@@ -404,11 +382,11 @@ def clear_all_device_counters(
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
 
-    run_ids = list_device_counters(blob_service_client)
+    device_prefixes = list_device_counters(blob_service_client)
     cleared_count = 0
 
-    for run_id in run_ids:
-        if clear_device_counter(run_id, blob_service_client):
+    for device_prefix in device_prefixes:
+        if clear_device_counter(device_prefix, blob_service_client):
             cleared_count += 1
 
     logger.info(f"Cleared {cleared_count} device counter(s)")
