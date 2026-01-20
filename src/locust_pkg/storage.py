@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import threading
 import time
 from typing import Any, Optional
 
@@ -25,28 +26,37 @@ device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
 device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "2500"))
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 
-# Global BlobServiceClient singleton
+# Global BlobServiceClient singleton with thread-safe initialization
 _blob_service_client: Optional[BlobServiceClient] = None
+_blob_service_client_lock: threading.Lock = threading.Lock()
 
 
 def get_blob_service_client() -> BlobServiceClient:
     """Get or create the global BlobServiceClient singleton.
+
+    Thread-safe: Uses double-checked locking pattern for efficient singleton initialization.
 
     Returns:
         BlobServiceClient: The global blob service client instance.
     """
     global _blob_service_client
 
-    if _blob_service_client is None:
-        if storage_conn_str is not None:
-            _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
-        elif storage_account_url is not None:
-            # Try Azure CLI first (fast for local dev), then fall back to DefaultAzureCredential
-            # (which includes ManagedIdentity, environment vars, etc. for cloud environments)
-            credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
-            _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
-        else:
-            raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
+    # Fast path: if already initialized, return immediately
+    if _blob_service_client is not None:
+        return _blob_service_client
+
+    # Slow path: acquire lock and check again (double-checked locking)
+    with _blob_service_client_lock:
+        if _blob_service_client is None:
+            if storage_conn_str is not None:
+                _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
+            elif storage_account_url is not None:
+                # Try Azure CLI first (fast for local dev), then fall back to DefaultAzureCredential
+                # (which includes ManagedIdentity, environment vars, etc. for cloud environments)
+                credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
+                _blob_service_client = BlobServiceClient(account_url=storage_account_url, credential=credential)
+            else:
+                raise Exception("Missing STORAGE_CONN_STR or STORAGE_ACCOUNT_URL environment variable")
 
     return _blob_service_client
 
@@ -71,12 +81,11 @@ def initialize_storage(blob_service_client: Optional[BlobServiceClient] = None) 
         container_client = blob_service_client.get_container_client(storage_container_name)
         container_client.create_container()
         logger.info(f"Created storage container: {storage_container_name}")
+    except ResourceExistsError:
+        # Container already exists, which is fine
+        logger.debug(f"Storage container already exists: {storage_container_name}")
     except Exception as e:
-        # Container might already exist, which is fine
-        if "ContainerAlreadyExists" in str(e) or "The specified container already exists" in str(e):
-            logger.debug(f"Storage container already exists: {storage_container_name}")
-        else:
-            logger.warning(f"Error creating storage container {storage_container_name}: {e}")
+        logger.warning(f"Error creating storage container {storage_container_name}: {e}")
 
     return blob_service_client
 

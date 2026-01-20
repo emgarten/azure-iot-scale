@@ -32,33 +32,31 @@ def x509_certificate_list_to_pem(cert_list: list[str]) -> str:
     return begin_cert_header + separator.join(cert_list) + end_cert_footer
 
 
-def parse_request_id_from_topic(topic: str) -> int | None:
+def parse_request_id_from_topic(topic: str) -> str | None:
     """Parse the request ID ($rid) from an IoT Hub MQTT topic.
 
     Extracts the $rid parameter from topics like:
     - $iothub/credentials/res/202/?$rid=66641568
-    - $iothub/credentials/res/200/?$rid=12345&$version=1
+    - $iothub/credentials/res/200/?$rid=550e8400-e29b-41d4-a716-446655440000&$version=1
 
     Args:
         topic: MQTT topic string
 
     Returns:
-        The request ID as an integer, or None if not found or invalid.
+        The request ID as a string, or None if not found.
     """
     parts = topic.split("/")
     if len(parts) < 5:
         return None
 
-    query_part = parts[4]  # e.g., "?$rid=66641568&$version=1"
+    query_part = parts[4]  # e.g., "?$rid=550e8400-e29b-41d4-a716-446655440000&$version=1"
     if query_part.startswith("?"):
         query_part = query_part[1:]
 
     for param in query_part.split("&"):
         if param.startswith("$rid="):
-            try:
-                return int(param[5:])
-            except ValueError:
-                return None
+            rid_value = param[5:]
+            return rid_value if rid_value else None
 
     return None
 
@@ -69,21 +67,24 @@ def retry_with_backoff(
     base_wait: int = 60,
     max_jitter: int = 30,
     max_timeout: float | None = None,
+    max_attempts: int | None = None,
 ) -> Any:
-    """Retry an operation with backoff and jitter, optionally with a timeout.
+    """Retry an operation with backoff and jitter, optionally with a timeout or max attempts.
 
     Args:
         operation_name: Name of the operation for logging
         operation_func: Function to execute (should return a value or raise exception)
         base_wait: Base wait time in seconds between retries (default: 60)
         max_jitter: Maximum random jitter in seconds to add to wait time (default: 30)
-        max_timeout: Maximum total time in seconds before giving up (default: None = retry indefinitely)
+        max_timeout: Maximum total time in seconds before giving up (default: None = no timeout)
+        max_attempts: Maximum number of attempts before giving up (default: None = no limit)
 
     Returns:
         The result of operation_func when it succeeds
 
     Raises:
         TimeoutError: If max_timeout is reached before the operation succeeds
+        Exception: If max_attempts is reached before the operation succeeds (re-raises last exception)
     """
     attempt = 0
     start_time = time.time()
@@ -96,6 +97,12 @@ def retry_with_backoff(
             return result
         except Exception as e:
             elapsed = time.time() - start_time
+
+            # Check if we've exceeded max attempts
+            if max_attempts is not None and attempt >= max_attempts:
+                logger.warning(f"{operation_name} failed after {attempt} attempts")
+                raise
+
             jitter = random.uniform(0, max_jitter)
             wait_time = base_wait + jitter
 

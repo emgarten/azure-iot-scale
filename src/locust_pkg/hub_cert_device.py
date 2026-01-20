@@ -15,7 +15,9 @@ import os
 import random
 import ssl
 import tempfile
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
@@ -103,11 +105,14 @@ class HubCertDevice:
         # Track last certificate chain response time (ticks from time.time())
         self.last_cert_chain_response_time: Optional[float] = None
 
-        # Track pending requests: request_id -> send_time (ticks from time.time())
-        self.pending_requests: dict[int, float] = {}
+        # Track pending requests: request_id (UUID string) -> send_time (ticks from time.time())
+        self.pending_requests: dict[str, float] = {}
 
         # Track disconnect reason for debugging
         self._last_disconnect_rc: Optional[int] = None
+
+        # Event for connection synchronization (replaces busy-wait loop)
+        self._connect_event: threading.Event = threading.Event()
 
     def _is_actually_connected(self) -> bool:
         """Check if MQTT client is actually connected.
@@ -171,6 +176,7 @@ class HubCertDevice:
         if rc == 0:
             self.is_connected = True
             self._last_disconnect_rc = None
+            self._connect_event.set()  # Signal successful connection
             logger.info(f"MQTT connected for {self.device_name}")
         else:
             self.is_connected = False
@@ -919,17 +925,14 @@ class HubCertDevice:
 
             # Connect to IoT Hub
             logger.debug(f"Connecting to {hostname} via MQTT")
+            self._connect_event.clear()  # Reset event before connection attempt
             self.client.connect(hostname, MQTT_PORT, keepalive=60)
             self.client.loop_start()
 
-            # Wait for connection
+            # Wait for connection using event-based synchronization (avoids busy-wait)
             connect_timeout = 120
-            connect_start = time.time()
-            while not self.client.is_connected() and (time.time() - connect_start) < connect_timeout:
-                time.sleep(0.1)
-
-            if not self.client.is_connected():
-                raise Exception("Failed to connect to IoT Hub via MQTT")
+            if not self._connect_event.wait(timeout=connect_timeout):
+                raise Exception("Failed to connect to IoT Hub via MQTT (timeout)")
 
             # Subscribe to response topic (once, for the lifetime of the connection)
             subscribe_topic = "$iothub/credentials/res/#"
@@ -1056,7 +1059,7 @@ class HubCertDevice:
         try:
             # Create CSR and publish request
             csr_data = self._create_csr()
-            request_id = random.randint(1, 99999999)
+            request_id = str(uuid.uuid4())
             publish_topic = f"$iothub/credentials/POST/issueCertificate/?$rid={request_id}"
             payload_dict: dict[str, str] = {"id": device_id, "csr": csr_data}
             if replace:

@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -62,14 +63,15 @@ class CertUser(User):
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
 
     # Distributed device ID range allocation (per-worker, shared across all CertUser instances)
+    _id_range_lock: threading.Lock = threading.Lock()  # Lock for thread-safe ID range allocation
     _id_range_start: int = 0  # Start of allocated range (inclusive)
     _id_range_end: int = 0  # End of allocated range (exclusive)
     _id_range_current: int = 0  # Next ID to use within the range
     _id_range_allocated: bool = False  # Whether a range has been allocated
 
     @classmethod
-    def _ensure_id_range(cls) -> None:
-        """Ensure an ID range is allocated for this worker.
+    def _ensure_id_range_unlocked(cls) -> None:
+        """Ensure an ID range is allocated for this worker (must hold _id_range_lock).
 
         This method allocates a new range from Azure Blob Storage if:
         - No range has been allocated yet, or
@@ -77,6 +79,8 @@ class CertUser(User):
 
         The allocation is atomic and uses ETag-based optimistic concurrency
         to ensure non-overlapping ranges across all workers.
+
+        Note: Caller must hold _id_range_lock before calling this method.
         """
         if cls._id_range_current >= cls._id_range_end:
             logger.info(f"Allocating new device ID range for prefix '{device_name_prefix}'")
@@ -94,12 +98,15 @@ class CertUser(User):
         2. Using IDs from the allocated range locally without coordination
         3. Automatically allocating a new range when the current one is exhausted
 
+        Thread-safe: Uses a lock to prevent concurrent access from multiple threads.
+
         Returns:
             A unique device name in the format "{prefix}{id}"
         """
-        cls._ensure_id_range()
-        device_id = cls._id_range_current
-        cls._id_range_current += 1
+        with cls._id_range_lock:
+            cls._ensure_id_range_unlocked()
+            device_id = cls._id_range_current
+            cls._id_range_current += 1
         device_name = f"{device_name_prefix}{device_id}"
         logger.info(f"Generated device name: {device_name}")
         return device_name
