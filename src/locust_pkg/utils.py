@@ -68,19 +68,25 @@ def retry_with_backoff(
     operation_func: Callable[[], Any],
     base_wait: int = 60,
     max_jitter: int = 30,
+    max_timeout: float | None = None,
 ) -> Any:
-    """Retry an operation indefinitely with exponential backoff and jitter.
+    """Retry an operation with backoff and jitter, optionally with a timeout.
 
     Args:
         operation_name: Name of the operation for logging
         operation_func: Function to execute (should return a value or raise exception)
         base_wait: Base wait time in seconds between retries (default: 60)
         max_jitter: Maximum random jitter in seconds to add to wait time (default: 30)
+        max_timeout: Maximum total time in seconds before giving up (default: None = retry indefinitely)
 
     Returns:
         The result of operation_func when it succeeds
+
+    Raises:
+        TimeoutError: If max_timeout is reached before the operation succeeds
     """
     attempt = 0
+    start_time = time.time()
     while True:
         attempt += 1
         try:
@@ -89,8 +95,15 @@ def retry_with_backoff(
                 logger.info(f"{operation_name} succeeded on attempt {attempt}")
             return result
         except Exception as e:
+            elapsed = time.time() - start_time
             jitter = random.uniform(0, max_jitter)
             wait_time = base_wait + jitter
+
+            # Check if we would exceed the timeout after waiting
+            if max_timeout is not None and (elapsed + wait_time) >= max_timeout:
+                logger.warning(f"{operation_name} timed out after {elapsed:.1f}s ({attempt} attempts)")
+                raise TimeoutError(f"{operation_name} timed out after {elapsed:.1f}s ({attempt} attempts)") from e
+
             logger.warning(f"{operation_name} failed (attempt {attempt}): {e}")
             logger.info(f"Retrying {operation_name} in {wait_time:.1f}s...")
             time.sleep(wait_time)

@@ -523,22 +523,40 @@ class HubCertDevice:
             # Re-raise to trigger retry
             raise
 
-    def _connect_with_retry(self, max_attempts: int = 3, base_wait: int = 30, max_jitter: int = 15) -> bool:
-        """Attempt to connect with retry logic.
+    def _connect_with_retry(
+        self,
+        max_attempts: int = 3,
+        base_wait: int = 30,
+        max_jitter: int = 15,
+        total_timeout: float = 300,
+    ) -> bool:
+        """Attempt to connect with retry logic and total timeout.
 
         This method wraps the connect() method with retry logic to handle
         transient connection failures. It will retry multiple times before
-        giving up.
+        giving up, but will also respect a total timeout to prevent blocking
+        indefinitely.
 
         Args:
             max_attempts: Maximum number of connection attempts (default: 3)
             base_wait: Base wait time in seconds between retries (default: 30)
             max_jitter: Maximum random jitter in seconds to add to wait time (default: 15)
+            total_timeout: Maximum total time in seconds before giving up (default: 300 = 5 minutes)
 
         Returns:
-            True if connection was successful, False after all retries exhausted.
+            True if connection was successful, False after all retries exhausted or timeout.
         """
+        start_time = time.time()
+
         for attempt in range(1, max_attempts + 1):
+            # Check if we've exceeded total timeout before attempting
+            elapsed = time.time() - start_time
+            if elapsed >= total_timeout:
+                logger.warning(
+                    f"Connection timed out after {elapsed:.1f}s for {self.device_name} " f"(before attempt {attempt})"
+                )
+                return False
+
             if self.connect():
                 if attempt > 1:
                     logger.info(f"Connection succeeded on attempt {attempt} for {self.device_name}")
@@ -547,6 +565,15 @@ class HubCertDevice:
             if attempt < max_attempts:
                 jitter = random.uniform(0, max_jitter)
                 wait_time = base_wait + jitter
+
+                # Check if waiting would exceed total timeout
+                elapsed = time.time() - start_time
+                if (elapsed + wait_time) >= total_timeout:
+                    logger.warning(
+                        f"Connection timed out after {elapsed:.1f}s for {self.device_name} " f"({attempt} attempts)"
+                    )
+                    return False
+
                 logger.warning(
                     f"Connection attempt {attempt}/{max_attempts} failed for {self.device_name}, "
                     f"retrying in {wait_time:.1f}s..."
@@ -597,14 +624,18 @@ class HubCertDevice:
                         self.registration_result = None
                         self.issued_cert_data = ""
 
-        # Provision with DPS (with retry logic)
+        # Provision with DPS (with retry logic, max 5 minutes)
         try:
             retry_with_backoff(
                 operation_name=f"provision_device({self.device_name})",
                 operation_func=self._provision_inner,
                 base_wait=60,
                 max_jitter=30,
+                max_timeout=300,  # 5 minutes max
             )
+        except TimeoutError as e:
+            logger.warning(f"Provisioning timed out for {self.device_name}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Provisioning failed for {self.device_name}: {e}")
             return False
