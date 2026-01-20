@@ -50,7 +50,7 @@ All code changes MUST pass `make check` before committing. This runs:
 - **Storage** (`storage.py`): Azure Blob Storage operations for:
   - Device registration data persistence (private keys, certificates)
   - Distributed device ID range allocation using ETag-based optimistic concurrency
-  - Run isolation via LOAD_TEST_RUN_ID or RUN_ID
+  - Counter isolation via DEVICE_NAME_PREFIX
 
 ### Key Patterns
 
@@ -64,7 +64,6 @@ All code changes MUST pass `make check` before committing. This runs:
 Required for running:
 - `PROVISIONING_HOST`, `PROVISIONING_IDSCOPE`, `PROVISIONING_SAS_KEY` - DPS config
 - `STORAGE_CONN_STR` or `STORAGE_ACCOUNT_URL` - Blob storage for state persistence
-- `LOAD_TEST_RUN_ID` or `RUN_ID` - Test run isolation
 
 ### Dependencies
 
