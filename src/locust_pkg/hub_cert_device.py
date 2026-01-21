@@ -713,6 +713,35 @@ class HubCertDevice:
         csr_der = csr.public_bytes(serialization.Encoding.DER)
         return base64.b64encode(csr_der).decode("utf-8")
 
+    def _fire_locust_event(
+        self,
+        name: str,
+        response_time: int,
+        response_length: int,
+        exception: Optional[str],
+        status_code: str,
+    ) -> None:
+        """Fire a Locust event for credential operations.
+
+        This method is called via gevent.spawn() to ensure events are fired
+        from the gevent context rather than the Paho MQTT thread.
+
+        Args:
+            name: The event name (e.g., "credential_accept", "credential_certificate")
+            response_time: Response time in milliseconds
+            response_length: Response payload size in bytes
+            exception: Exception message if this is a failure event, None otherwise
+            status_code: HTTP-like status code from the MQTT topic
+        """
+        self.environment.events.request.fire(
+            request_type="Hub",
+            name=name,
+            response_time=response_time,
+            response_length=response_length,
+            exception=exception,
+            context={"device_name": self.device_name, "status_code": status_code},
+        )
+
     def _credential_on_message(
         self,
         client: mqtt.Client,
@@ -721,8 +750,12 @@ class HubCertDevice:
     ) -> None:
         """Handle credential response messages from IoT Hub (observer pattern).
 
-        This callback is invoked when messages arrive on the credential response topic.
-        It emits different Locust events based on the response type:
+        This callback is invoked from the Paho MQTT thread when messages arrive
+        on the credential response topic. To avoid thread/greenlet issues with
+        Locust's gevent-based event system, we use gevent.spawn() to marshal
+        event firing to the gevent context.
+
+        Event types emitted:
         - credential_accept: Status 202 (request accepted, waiting for certificate)
         - credential_certificate: Status 200 (certificate chain received)
         - credential_parse_error: Failed to parse JSON response
@@ -761,15 +794,15 @@ class HubCertDevice:
                 payload_str = msg.payload.decode("utf-8")
                 payload_data = json.loads(payload_str)
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                # Emit parse error event
+                # Emit parse error event via gevent to marshal to greenlet context
                 logger.error(f"Error parsing credential response: {e}")
-                self.environment.events.request.fire(
-                    request_type="Hub",
+                gevent.spawn(
+                    self._fire_locust_event,
                     name="credential_parse_error",
                     response_time=0,
                     response_length=payload_size,
                     exception=f"Failed to parse response: {e}",
-                    context={"device_name": self.device_name, "status_code": status_code},
+                    status_code=status_code,
                 )
                 return
 
@@ -777,13 +810,13 @@ class HubCertDevice:
         if status_code == "202":
             # Request accepted, waiting for certificate (don't remove from pending_requests)
             logger.debug(f"Credential request accepted for {self.device_name}")
-            self.environment.events.request.fire(
-                request_type="Hub",
+            gevent.spawn(
+                self._fire_locust_event,
                 name="credential_accept",
                 response_time=response_time_ms,
                 response_length=payload_size,
                 exception=None,
-                context={"device_name": self.device_name, "status_code": status_code},
+                status_code=status_code,
             )
 
         elif status_code == "200":
@@ -794,35 +827,35 @@ class HubCertDevice:
                     # Certificate chain received - record timestamp
                     self.last_cert_chain_response_time = time.time()
                     logger.info(f"Certificate chain received for {self.device_name}")
-                    self.environment.events.request.fire(
-                        request_type="Hub",
+                    gevent.spawn(
+                        self._fire_locust_event,
                         name="credential_certificate",
                         response_time=response_time_ms,
                         response_length=payload_size,
                         exception=None,
-                        context={"device_name": self.device_name, "status_code": status_code},
+                        status_code=status_code,
                     )
                 else:
                     # Empty certificates array
                     logger.warning(f"Empty certificates array for {self.device_name}")
-                    self.environment.events.request.fire(
-                        request_type="Hub",
+                    gevent.spawn(
+                        self._fire_locust_event,
                         name="credential_missing_certificates",
                         response_time=response_time_ms,
                         response_length=payload_size,
                         exception="Certificates array is empty",
-                        context={"device_name": self.device_name, "status_code": status_code},
+                        status_code=status_code,
                     )
             else:
                 # No certificates field in response
                 logger.warning(f"No certificates field in response for {self.device_name}")
-                self.environment.events.request.fire(
-                    request_type="Hub",
+                gevent.spawn(
+                    self._fire_locust_event,
                     name="credential_missing_certificates",
                     response_time=response_time_ms,
                     response_length=payload_size,
                     exception="No certificates field in response",
-                    context={"device_name": self.device_name, "status_code": status_code},
+                    status_code=status_code,
                 )
 
             # Remove from pending_requests for non-202 responses
@@ -832,13 +865,13 @@ class HubCertDevice:
         else:
             # Unexpected status code
             logger.warning(f"Credential request returned unexpected status {status_code} for {self.device_name}")
-            self.environment.events.request.fire(
-                request_type="Hub",
+            gevent.spawn(
+                self._fire_locust_event,
                 name="credential_unexpected_status",
                 response_time=response_time_ms,
                 response_length=payload_size,
                 exception=f"Unexpected status code: {status_code}",
-                context={"device_name": self.device_name, "status_code": status_code},
+                status_code=status_code,
             )
 
             # Remove from pending_requests for non-202 responses

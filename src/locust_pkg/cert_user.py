@@ -143,6 +143,32 @@ class CertUser(User):
 
         logger.info(f"CertUser initialized with {len(self.devices)} device(s)")
 
+    def on_start(self) -> None:
+        """Eagerly provision and connect all devices before tasks run.
+
+        This prevents blocking during task execution, which would break
+        constant_pacing timing. Devices that fail to provision/connect
+        are logged but kept in the list for retry attempts during tasks.
+        """
+        logger.info(f"Starting eager initialization for {len(self.devices)} device(s)")
+
+        for i, device in enumerate(self.devices):
+            logger.info(f"Initializing device {i + 1}/{len(self.devices)}: {device.device_name}")
+
+            # Provision if not already provisioned
+            if not self._is_device_provisioned(device):
+                if not device.provision():
+                    logger.warning(f"Failed to provision device {device.device_name} during startup")
+                    continue  # provision() already handles connect on success
+
+            # Connect if provisioned but not connected (e.g., restored from storage without validation)
+            if not device.is_connected:
+                if not device.connect():
+                    logger.warning(f"Failed to connect device {device.device_name} during startup")
+
+        connected_count = sum(1 for d in self.devices if d.is_connected)
+        logger.info(f"Eager initialization complete: {connected_count}/{len(self.devices)} devices connected")
+
     def _get_next_device(self) -> HubCertDevice | None:
         """Get the next device in round-robin fashion.
 
@@ -172,10 +198,9 @@ class CertUser(User):
     def request_certificate(self) -> None:
         """Request a certificate renewal from the next device in round-robin order.
 
-        This method handles lazy initialization:
-        - If the device hasn't been provisioned, provision it first
-        - If the device isn't connected, connect it first
-        - Emit the duration since the last certificate response (if available)
+        Devices are eagerly initialized in on_start(), so this task should not
+        block on provisioning or connection. The request_new_certificate method
+        handles reconnection if the connection was lost.
         """
         device = self._get_next_device()
 
@@ -188,19 +213,10 @@ class CertUser(User):
         if time_since_last is not None:
             logger.info(f"Device {device.device_name}: {time_since_last:.2f}s since last cert response")
 
-        # Lazy provisioning: provision if not already provisioned
+        # Skip devices that failed to provision during on_start()
         if not self._is_device_provisioned(device):
-            logger.info(f"Device {device.device_name} not provisioned, provisioning now")
-            if not device.provision():
-                logger.warning(f"Failed to provision device {device.device_name}, skipping")
-                return
-
-        # Lazy connection: connect if not connected
-        if not device.is_connected:
-            logger.info(f"Device {device.device_name} not connected, connecting now")
-            if not device.connect():
-                logger.warning(f"Failed to connect device {device.device_name}, skipping")
-                return
+            logger.debug(f"Device {device.device_name} not provisioned, skipping")
+            return
 
         device.request_new_certificate(replace=cert_replace_enabled)
 
