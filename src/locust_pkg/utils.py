@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+import gevent
 import orjson
 
 logger = logging.getLogger("locust.utils")
@@ -113,4 +114,4 @@ def retry_with_backoff(
 
             logger.warning(f"{operation_name} failed (attempt {attempt}): {e}")
             logger.info(f"Retrying {operation_name} in {wait_time:.1f}s...")
-            time.sleep(wait_time)
+            gevent.sleep(wait_time)

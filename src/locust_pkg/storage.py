@@ -2,9 +2,9 @@ import logging
 import os
 import random
 import threading
-import time
 from typing import Any, Optional
 
+import gevent
 import orjson
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
@@ -265,7 +265,7 @@ def allocate_device_id_range(
                 except ResourceExistsError:
                     # Another worker created it, retry
                     logger.debug(f"Counter blob created by another worker, retrying (attempt {attempt + 1})")
-                    time.sleep(random.uniform(0.1, 0.5))
+                    gevent.sleep(random.uniform(0.1, 0.5))
                     continue
             else:
                 # Update existing blob with ETag check
@@ -279,7 +279,7 @@ def allocate_device_id_range(
                 except ResourceModifiedError:
                     # Another worker updated it, retry
                     logger.debug(f"Counter blob modified by another worker, retrying (attempt {attempt + 1})")
-                    time.sleep(random.uniform(0.1, 0.5))
+                    gevent.sleep(random.uniform(0.1, 0.5))
                     continue
 
             # Success!
@@ -288,7 +288,7 @@ def allocate_device_id_range(
 
         except Exception as e:
             logger.warning(f"Error allocating device ID range (attempt {attempt + 1}): {e}")
-            time.sleep(random.uniform(0.5, 1.0))
+            gevent.sleep(random.uniform(0.5, 1.0))
 
     raise Exception(f"Failed to allocate device ID range after {max_retries} attempts")
 

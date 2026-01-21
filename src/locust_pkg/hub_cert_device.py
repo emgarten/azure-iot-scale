@@ -15,8 +15,10 @@ import os
 import random
 import ssl
 import tempfile
-import threading
 import time
+
+import gevent
+from gevent.event import Event as GeventEvent
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
@@ -112,7 +114,8 @@ class HubCertDevice:
         self._last_disconnect_rc: Optional[int] = None
 
         # Event for connection synchronization (replaces busy-wait loop)
-        self._connect_event: threading.Event = threading.Event()
+        # Uses gevent.Event instead of threading.Event to yield to other greenlets during wait()
+        self._connect_event: GeventEvent = GeventEvent()
 
     def _is_actually_connected(self) -> bool:
         """Check if MQTT client is actually connected.
@@ -584,7 +587,7 @@ class HubCertDevice:
                     f"Connection attempt {attempt}/{max_attempts} failed for {self.device_name}, "
                     f"retrying in {wait_time:.1f}s..."
                 )
-                time.sleep(wait_time)
+                gevent.sleep(wait_time)
             else:
                 logger.error(f"All {max_attempts} connection attempts failed for {self.device_name}")
 
