@@ -12,7 +12,6 @@ import hashlib
 import hmac
 import json
 import os
-import random
 import signal
 import ssl
 import sys
@@ -413,7 +412,8 @@ def request_new_certificate(
     Returns:
         Path to the saved renewed certificate file.
     """
-    request_id = random.randint(1, 99999999)
+    # request_id = random.randint(1, 99999999)
+    request_id = 71929353
     subscribe_topic = "$iothub/credentials/res/#"
     publish_topic = f"$iothub/credentials/POST/issueCertificate/?$rid={request_id}"
 
@@ -432,6 +432,7 @@ def request_new_certificate(
         print(f"\n{'=' * 70}")
         print("CREDENTIAL RESPONSE RECEIVED!")
         print(f"{'=' * 70}")
+        first_202 = True
 
         # Extract status code from topic
         # Topic format: $iothub/credentials/res/202/?$rid=999888777&$version=1
@@ -464,6 +465,14 @@ def request_new_certificate(
 
         if status_code == "202" or status_code == "200":
             print(f"SUCCESS: Received certificate response (status {status_code})")
+
+            if status_code == "202" and first_202:
+                first_202 = False
+                # Wait 1 seconds after receiving response, then unsubscribe from credential topic
+                # print("Waiting 1 seconds before unsubscribing from credential topic...")
+                # time.sleep(0.01)
+                # print(f"Unsubscribing from: {subscribe_topic} at {time.time()}")
+                # client.unsubscribe(subscribe_topic)
         else:
             response_error = f"Unexpected status code: {status_code}"
             print(f"WARNING: Unexpected status code {status_code}")

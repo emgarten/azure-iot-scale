@@ -16,19 +16,18 @@ import random
 import ssl
 import tempfile
 import time
-
-import gevent
-from gevent.event import Event as GeventEvent
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
+import gevent
 import paho.mqtt.client as mqtt
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 from cryptography.x509.oid import NameOID
+from gevent.event import Event as GeventEvent
 
 from storage import delete_device_data as _delete_device_data
 from storage import load_device_data as _load_device_data
@@ -101,8 +100,8 @@ class HubCertDevice:
         # Paho MQTT client for hub connection
         self.client: Optional[mqtt.Client] = None
         self.is_connected: bool = False
-        self.cert_file: Optional[str] = None
-        self.key_file: Optional[str] = None
+        # Note: Temp files are now cleaned up immediately after SSL context loading
+        # to minimize disk usage at scale
 
         # Track last certificate chain response time (ticks from time.time())
         self.last_cert_chain_response_time: Optional[float] = None
@@ -593,16 +592,21 @@ class HubCertDevice:
 
         return False
 
-    def provision(self) -> bool:
+    def provision(self, storage_only: bool = False) -> bool:
         """Provision the device with DPS.
 
         This method first tries to load existing registration from storage.
         If found, it validates the data by attempting to connect to the hub.
         If the connection fails after multiple retries (e.g., expired certificate),
-        it deletes the bad data and falls back to DPS provisioning.
+        it deletes the bad data and falls back to DPS provisioning (unless storage_only=True).
 
         After successful DPS provisioning, it also validates by connecting.
         The connection is kept open for efficiency.
+
+        Args:
+            storage_only: If True, only load from storage and don't provision via DPS.
+                         Returns False if no stored data exists. Useful for load testing
+                         with pre-provisioned devices.
 
         Returns:
             True if device is successfully provisioned and connected,
@@ -633,6 +637,11 @@ class HubCertDevice:
                         self.registration_result = None
                         self.issued_cert_data = ""
 
+        # If storage_only mode is enabled and we got here, there's no valid stored data
+        if storage_only:
+            logger.debug(f"Storage-only mode: no valid stored data for {self.device_name}, skipping DPS")
+            return False
+
         # Provision with DPS (with retry logic, max 5 minutes)
         try:
             retry_with_backoff(
@@ -641,6 +650,7 @@ class HubCertDevice:
                 base_wait=60,
                 max_jitter=30,
                 max_timeout=300,  # 5 minutes max
+                max_attempts=10
             )
         except TimeoutError as e:
             logger.warning(f"Provisioning timed out for {self.device_name}: {e}")
@@ -683,21 +693,8 @@ class HubCertDevice:
             self.client = None
 
         self.is_connected = False
-
-        # Clean up temporary certificate and key files
-        if self.cert_file and os.path.exists(self.cert_file):
-            try:
-                os.unlink(self.cert_file)
-            except Exception as e:
-                logger.debug(f"Error removing cert file: {e}")
-            self.cert_file = None
-
-        if self.key_file and os.path.exists(self.key_file):
-            try:
-                os.unlink(self.key_file)
-            except Exception as e:
-                logger.debug(f"Error removing key file: {e}")
-            self.key_file = None
+        # Note: Temp files are now cleaned up immediately after SSL context loading
+        # so no cleanup needed here
 
     def _create_csr(self) -> str:
         """Create a CSR using the existing private key.
@@ -862,9 +859,67 @@ class HubCertDevice:
             if request_id is not None and request_id in self.pending_requests:
                 del self.pending_requests[request_id]
 
+        elif status_code == "429":
+            # Rate limited - log and continue (no backoff, just drop and keep sending)
+            logger.debug(f"Rate limited (429) for {self.device_name}, dropping and continuing")
+            gevent.spawn(
+                self._fire_locust_event,
+                name="credential_rate_limited",
+                response_time=response_time_ms,
+                response_length=payload_size,
+                exception=None,  # Not an error - expected under load
+                status_code=status_code,
+            )
+
+            # Remove from pending_requests
+            if request_id is not None and request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+
+        elif status_code == "412":
+            # Precondition Failed - expected when using invalid "replace" field
+            # This is normal operation - the invalid replace ensures no 409 conflicts
+            logger.debug(f"Precondition failed (412) for {self.device_name} - expected with invalid replace")
+            gevent.spawn(
+                self._fire_locust_event,
+                name="credential_invalid_replace",
+                response_time=response_time_ms,
+                response_length=payload_size,
+                exception=None,  # Not an error - expected behavior
+                status_code=status_code,
+            )
+
+            # Remove from pending_requests
+            if request_id is not None and request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+
+        elif status_code in ("400", "401", "403", "404", "500", "503"):
+            # Known error status codes - log with payload details
+            error_message = None
+            if payload_data:
+                error_message = payload_data.get("message") or payload_data.get("error")
+            logger.warning(
+                f"Credential request failed with status {status_code} for {self.device_name}: "
+                f"error={error_message}, payload={payload_data}"
+            )
+            gevent.spawn(
+                self._fire_locust_event,
+                name=f"credential_error_{status_code}",
+                response_time=response_time_ms,
+                response_length=payload_size,
+                exception=f"Error {status_code}: {error_message}",
+                status_code=status_code,
+            )
+
+            # Remove from pending_requests
+            if request_id is not None and request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+
         else:
-            # Unexpected status code
-            logger.warning(f"Credential request returned unexpected status {status_code} for {self.device_name}")
+            # Unexpected status code - log full details for debugging
+            logger.warning(
+                f"Credential request returned unexpected status {status_code} for {self.device_name}, "
+                f"payload={payload_data}"
+            )
             gevent.spawn(
                 self._fire_locust_event,
                 name="credential_unexpected_status",
@@ -923,21 +978,43 @@ class HubCertDevice:
         start_time = time.time()
 
         try:
-            # Serialize the private key to PEM format
+            # Serialize the private key to PEM format (in-memory, no temp files)
             private_key_pem = self.private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption(),
-            ).decode("utf-8")
+            )
 
-            # Write certificate and key to temporary files for MQTT TLS
-            cert_fd, self.cert_file = tempfile.mkstemp(suffix=".pem", text=True)
-            key_fd, self.key_file = tempfile.mkstemp(suffix=".pem", text=True)
+            # Load certificate and key directly into SSL context (no temp files)
+            # This is critical for scale - temp files create disk I/O and inode pressure
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = True
+            # Write certificate and key to temporary files, load into SSL context,
+            # then immediately delete the temp files. This is necessary because
+            # ssl.SSLContext.load_cert_chain() doesn't support loading from memory
+            # in Python < 3.13. Immediate cleanup minimizes disk/inode pressure at scale.
+            cert_fd, temp_cert_file = tempfile.mkstemp(suffix=".pem", text=True)
+            key_fd, temp_key_file = tempfile.mkstemp(suffix=".pem", text=True)
+            try:
+                with os.fdopen(cert_fd, "w") as f:
+                    f.write(self.issued_cert_data)
+                with os.fdopen(key_fd, "wb") as f:
+                    f.write(private_key_pem)
 
-            with os.fdopen(cert_fd, "w") as f:
-                f.write(self.issued_cert_data)
-            with os.fdopen(key_fd, "w") as f:
-                f.write(private_key_pem)
+                # Create SSL context and load certs
+                ssl_context = ssl.create_default_context()
+                ssl_context.load_cert_chain(certfile=temp_cert_file, keyfile=temp_key_file)
+            finally:
+                # Clean up temp files immediately after loading into SSL context
+                # This minimizes disk usage and inode consumption at scale
+                try:
+                    os.unlink(temp_cert_file)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temp_key_file)
+                except OSError:
+                    pass
 
             # Create MQTT client
             self.client = mqtt.Client(
@@ -949,9 +1026,7 @@ class HubCertDevice:
             username = f"{hostname}/{device_id}/?api-version={API_VERSION}"
             self.client.username_pw_set(username=username)
 
-            # Configure TLS with client certificate
-            ssl_context = ssl.create_default_context()
-            ssl_context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+            # Configure TLS with loaded SSL context
             self.client.tls_set_context(ssl_context)
 
             # Set callbacks for connection state tracking
@@ -1040,7 +1115,7 @@ class HubCertDevice:
             return None
         return time.time() - self.last_cert_chain_response_time
 
-    def request_new_certificate(self, replace: bool = False) -> bool:
+    def request_new_certificate(self, replace: bool = False, use_invalid_replace: bool = False) -> bool:
         """Request a new certificate from IoT Hub via MQTT credential management API.
 
         This method sends a CSR to request a new certificate using the persistent
@@ -1053,6 +1128,8 @@ class HubCertDevice:
 
         Args:
             replace: If True, include "replace": "*" in the payload to replace existing certificates.
+            use_invalid_replace: If True, include "replace": "invalid" to avoid 409 conflicts
+                               (used for throttle testing). Takes precedence over `replace`.
 
         Returns:
             True if the request was successfully sent, False otherwise.
@@ -1098,7 +1175,10 @@ class HubCertDevice:
             request_id = str(uuid.uuid4())
             publish_topic = f"$iothub/credentials/POST/issueCertificate/?$rid={request_id}"
             payload_dict: dict[str, str] = {"id": device_id, "csr": csr_data}
-            if replace:
+            if use_invalid_replace:
+                # Use invalid replace to avoid 409 conflicts (for throttle testing)
+                payload_dict["replace"] = "invalid"
+            elif replace:
                 payload_dict["replace"] = "*"
             payload = json.dumps(payload_dict)
 
