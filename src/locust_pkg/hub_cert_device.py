@@ -650,7 +650,7 @@ class HubCertDevice:
                 base_wait=60,
                 max_jitter=30,
                 max_timeout=300,  # 5 minutes max
-                max_attempts=10
+                max_attempts=10,
             )
         except TimeoutError as e:
             logger.warning(f"Provisioning timed out for {self.device_name}: {e}")
@@ -861,7 +861,7 @@ class HubCertDevice:
 
         elif status_code == "429":
             # Rate limited - log and continue (no backoff, just drop and keep sending)
-            logger.debug(f"Rate limited (429) for {self.device_name}, dropping and continuing")
+            logger.warning(f"Rate limited (429) for {self.device_name}, dropping and continuing")
             gevent.spawn(
                 self._fire_locust_event,
                 name="credential_rate_limited",
@@ -878,7 +878,7 @@ class HubCertDevice:
         elif status_code == "412":
             # Precondition Failed - expected when using invalid "replace" field
             # This is normal operation - the invalid replace ensures no 409 conflicts
-            logger.debug(f"Precondition failed (412) for {self.device_name} - expected with invalid replace")
+            logger.warning(f"Precondition failed (412) for {self.device_name} - expected with invalid replace")
             gevent.spawn(
                 self._fire_locust_event,
                 name="credential_invalid_replace",
@@ -892,7 +892,7 @@ class HubCertDevice:
             if request_id is not None and request_id in self.pending_requests:
                 del self.pending_requests[request_id]
 
-        elif status_code in ("400", "401", "403", "404", "500", "503"):
+        elif status_code in ("400", "401", "403", "404", "409", "500", "503"):
             # Known error status codes - log with payload details
             error_message = None
             if payload_data:

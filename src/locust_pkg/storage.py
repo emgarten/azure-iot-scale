@@ -27,7 +27,7 @@ device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
 
 # Increased default for scale: 50000 IDs per range reduces counter contention
 # With 1M devices and 50000 per range, only 20 allocations needed per worker
-device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "50000"))
+device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "5000"))
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 
 # Counter sharding: number of counter partitions to reduce contention
