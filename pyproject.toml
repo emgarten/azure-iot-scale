@@ -34,7 +34,7 @@ include = '\.pyi?$'
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 strict = true
 ignore_missing_imports = true
 disallow_untyped_calls = true
