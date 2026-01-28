@@ -8,22 +8,22 @@ check: ## Run code quality tools
 	@echo "Checking lock file consistency with 'pyproject.toml'"
 	@uv lock --locked
 	@echo "Running ruff to lint code"
-	@uv run ruff check src tests --fix
+	@uv run ruff check src tests tools --fix
 	@echo "Running black to format code"
-	@uv run black src tests
+	@uv run black src tests tools
 	@echo "Static type checking: Running mypy"
-	@uv run mypy src tests
+	@uv run mypy src tests tools
 
 .PHONY: check-no-fix
 check-no-fix: ## Run code quality tools without fixing issues
 	@echo "Checking lock file consistency with 'pyproject.toml'"
 	@uv lock --check --offline
 	@echo "Running ruff to lint code"
-	@uv run ruff check src tests
+	@uv run ruff check src tests tools
 	@echo "Running black to format code"
-	@uv run black src tests --check
+	@uv run black src tests tools --check
 	@echo "Static type checking: Running mypy"
-	@uv run mypy src tests
+	@uv run mypy src tests tools
 
 .PHONY: test
 test: ## Test the code with pytest

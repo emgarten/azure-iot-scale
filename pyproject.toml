@@ -12,6 +12,7 @@ dependencies = [
     "locust>=2.42.5",
     "orjson>=3.11.4",
     "paho-mqtt>=1.6.1,<2.0.0",
+    "requests>=2.32.0",
 ]
 
 [dependency-groups]
@@ -24,6 +25,7 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-httpx>=0.35.0",
     "ruff==0.11.10",
+    "types-requests>=2.32.0",
 ]
 
 [tool.black]
@@ -32,7 +34,7 @@ include = '\.pyi?$'
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 strict = true
 ignore_missing_imports = true
 disallow_untyped_calls = true
