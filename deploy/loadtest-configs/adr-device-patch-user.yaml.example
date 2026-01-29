@@ -1,0 +1,11 @@
+version: v0.1
+testId: adr-device-patch-user-test
+displayName: "AdrDevicePatchUser - ADR Device Patch Load Test"
+description: "Tests ADR device patch operations against Azure IoT"
+testPlan: ../../src/locust_pkg/adr_device_patch_user.py
+testType: Locust
+engineInstances: 1
+autoStop: disable
+referenceIdentities:
+  - kind: Engine
+    type: SystemAssigned
