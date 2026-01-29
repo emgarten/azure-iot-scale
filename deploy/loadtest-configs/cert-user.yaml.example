@@ -1,0 +1,7 @@
+version: v0.1
+testId: cert-user-test
+displayName: "CertUser - Certificate Renewal Load Test"
+description: "Tests certificate-based device provisioning and renewal against Azure IoT Hub and DPS"
+testPlan: ../../src/locust_pkg/cert_user.py
+testType: Locust
+engineInstances: 1
