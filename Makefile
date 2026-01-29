@@ -30,10 +30,20 @@ test: ## Test the code with pytest
 	@echo "Testing code: Running pytest"
 	@uv run pytest tests --disable-warnings -v
 
-.PHONY: run
-run: ## Run locust load test
-	@echo "Running locust load test"
+.PHONY: run-cert
+run-cert: ## Run locust load test with CertUser
+	@echo "Running locust load test with CertUser"
 	@PYTHONPATH=src/locust_pkg uv run --env-file .env locust -f src/locust_pkg --headless --autostart --run-time 300s --loglevel DEBUG CertUser
+
+.PHONY: run-adr
+run-adr: ## Run locust load test with AdrDevicePatchUser
+	@echo "Running locust load test with AdrDevicePatchUser"
+	@PYTHONPATH=src/locust_pkg uv run --env-file .env locust -f src/locust_pkg --headless --autostart --run-time 300s --loglevel DEBUG AdrDevicePatchUser
+
+.PHONY: run-hub-connect
+run-hub-connect: ## Run locust load test with CertHubConnectUser
+	@echo "Running locust load test with CertHubConnectUser"
+	@PYTHONPATH=src/locust_pkg uv run --env-file .env locust -f src/locust_pkg --headless --autostart --run-time 300s --loglevel DEBUG CertHubConnectUser
 
 .PHONY: build
 build: clean-build ## Create requirements.txt file in /dist
