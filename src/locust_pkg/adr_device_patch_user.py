@@ -5,7 +5,6 @@ patches the operatingSystemVersion field to measure latency and throughput.
 """
 
 import logging
-import os
 import secrets
 import time
 from typing import Any
@@ -13,38 +12,20 @@ from typing import Any
 from locust import User, constant_pacing, task
 
 from adr_utils import create_adr_device, delete_adr_device, get_adr_token, patch_adr_device_os_version
+from utils import log_all_env_vars, require_env
 
 logger = logging.getLogger("locust.adr_device_patch_user")
 
-# Environment configuration (required)
-adr_subscription_id = os.getenv("ADR_SUBSCRIPTION_ID", "")
-adr_resource_group = os.getenv("ADR_RESOURCE_GROUP", "")
-adr_namespace = os.getenv("ADR_NAMESPACE", "")
-adr_location = os.getenv("ADR_LOCATION", "")
+# Log all environment variables for debugging
+log_all_env_vars()
 
-# Environment configuration (optional)
-adr_device_prefix = os.getenv("ADR_DEVICE_PREFIX", "device")
-adr_patch_interval = int(os.getenv("ADR_PATCH_INTERVAL", "5"))  # seconds
-
-
-def _validate_required_env_vars() -> None:
-    """Validate that all required environment variables are set.
-
-    Raises:
-        ValueError: If any required environment variable is missing.
-    """
-    missing = []
-    if not adr_subscription_id:
-        missing.append("ADR_SUBSCRIPTION_ID")
-    if not adr_resource_group:
-        missing.append("ADR_RESOURCE_GROUP")
-    if not adr_namespace:
-        missing.append("ADR_NAMESPACE")
-    if not adr_location:
-        missing.append("ADR_LOCATION")
-
-    if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+# Environment configuration (all required)
+adr_subscription_id = require_env("ADR_SUBSCRIPTION_ID")
+adr_resource_group = require_env("ADR_RESOURCE_GROUP")
+adr_namespace = require_env("ADR_NAMESPACE")
+adr_location = require_env("ADR_LOCATION")
+adr_device_prefix = require_env("ADR_DEVICE_PREFIX")
+adr_patch_interval = int(require_env("ADR_PATCH_INTERVAL"))  # seconds
 
 
 class AdrDevicePatchUser(User):
@@ -66,9 +47,6 @@ class AdrDevicePatchUser(User):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-
-        # Validate environment variables
-        _validate_required_env_vars()
 
         # Generate unique device name with random hex suffix
         suffix = secrets.token_hex(4)  # 8 hex characters

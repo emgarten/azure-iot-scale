@@ -11,20 +11,22 @@ from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, Re
 from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
+from utils import require_env
+
 logger = logging.getLogger("locust.storage")
 
 # Storage authentication (in order of preference):
 # 1. STORAGE_CONN_STR - Connection string for the storage account
 # 2. STORAGE_ACCOUNT_URL - Account URL (e.g., https://<account>.blob.core.windows.net)
 #    with DefaultAzureCredential (managed identity, Azure CLI, etc.)
-# At least one must be set, otherwise an exception is raised.
+# At least one must be set, otherwise an exception is raised in get_blob_service_client().
 storage_conn_str = os.getenv("STORAGE_CONN_STR")
 storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
-storage_container_name = os.getenv("STORAGE_CONTAINER_NAME", "scale")
-counter_blob_prefix = os.getenv("COUNTER_BLOB_PREFIX", "counter")
-device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
-device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "2500"))
-device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
+storage_container_name = require_env("STORAGE_CONTAINER_NAME")
+counter_blob_prefix = require_env("COUNTER_BLOB_PREFIX")
+device_data_blob_prefix = require_env("DEVICE_DATA_BLOB_PREFIX")
+device_id_range_size = int(require_env("DEVICE_ID_RANGE_SIZE"))
+device_name_prefix = require_env("DEVICE_NAME_PREFIX")
 
 # Global BlobServiceClient singleton with thread-safe initialization
 _blob_service_client: Optional[BlobServiceClient] = None

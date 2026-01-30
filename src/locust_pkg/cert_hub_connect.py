@@ -6,7 +6,6 @@ this user connects and disconnects as part of each task iteration.
 """
 
 import logging
-import os
 import sys
 import tempfile
 import threading
@@ -15,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from locust import User, constant_pacing, events, task
+
+from utils import log_all_env_vars, require_env
 
 # Load the azure-iot-device wheel if present
 wheel_path = Path("azure_iot_device-2.14.0-py3-none-any.whl")
@@ -31,18 +32,20 @@ from storage import allocate_device_id_range, clear_device_counter, initialize_s
 
 logger = logging.getLogger("locust.cert_hub_connect")
 
+# Log all environment variables for debugging
+log_all_env_vars()
+
+# Environment configuration (all required)
+connect_request_interval = int(require_env("CONNECT_REQUEST_INTERVAL"))  # seconds
+device_name_prefix = require_env("DEVICE_NAME_PREFIX")
+devices_per_user = int(require_env("DEVICES_PER_USER"))  # number of devices per user
+
 
 @events.test_stop.add_listener  # type: ignore[misc]
 def on_test_stop(environment: Any, **kwargs: Any) -> None:
     """Clean up the device counter blob when the test stops."""
     logger.info("Test stopping, cleaning up device counter")
     clear_device_counter()
-
-
-# Environment configuration
-connect_request_interval = int(os.getenv("CONNECT_REQUEST_INTERVAL", "90"))  # seconds
-device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
-devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
 
 
 class CertHubConnectUser(User):

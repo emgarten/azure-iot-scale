@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -8,6 +9,31 @@ import gevent
 import orjson
 
 logger = logging.getLogger("locust.utils")
+
+
+def log_all_env_vars() -> None:
+    """Log all environment variables (sorted) for debugging."""
+    logger.info("All environment variables:")
+    for key, value in sorted(os.environ.items()):
+        logger.info(f"  {key}={value}")
+
+
+def require_env(name: str) -> str:
+    """Get required environment variable, raising if not set.
+
+    Args:
+        name: The name of the environment variable.
+
+    Returns:
+        The value of the environment variable.
+
+    Raises:
+        ValueError: If the environment variable is not set.
+    """
+    value = os.getenv(name)
+    if value is None:
+        raise ValueError(f"Required environment variable {name} is not set")
+    return value
 
 
 # Create a message of the given size with the current UTC timestamp
