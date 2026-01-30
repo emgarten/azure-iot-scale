@@ -1,7 +1,0 @@
-version: v0.1
-testId: http-user-test
-displayName: "BasicHttpUser - HTTP Endpoint Load Test"
-description: "Simple HTTP user for basic endpoint testing"
-testPlan: ../../src/locust_pkg/http_user.py
-testType: Locust
-engineInstances: 1

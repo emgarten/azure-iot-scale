@@ -4,7 +4,6 @@
 #
 # Before running, create config files from examples:
 #   cp deploy/loadtest-configs/cert-user.yaml.example deploy/loadtest-configs/cert-user.yaml
-#   cp deploy/loadtest-configs/http-user.yaml.example deploy/loadtest-configs/http-user.yaml
 #   cp deploy/loadtest-configs/adr-device-patch-user.yaml.example deploy/loadtest-configs/adr-device-patch-user.yaml
 #   cp deploy/loadtest-configs/cert-hub-connect-user.yaml.example deploy/loadtest-configs/cert-hub-connect-user.yaml
 #
@@ -37,7 +36,7 @@ if [ $# -lt 4 ] || [ $# -gt 5 ]; then
     echo "  group        - Resource group name"
     echo "  id           - Resource identifier (used for all resource names)"
     echo "  region       - Azure region (e.g., westus2)"
-    echo "  test-type    - Optional: cert|http|adr|hub-connect|all (default: all)"
+    echo "  test-type    - Optional: cert|adr|hub-connect|all (default: all)"
     echo ""
     echo "Examples:"
     echo "  $0 my-subscription my-rg loadtest-001 westus2"
@@ -62,11 +61,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Validate test type
 case "$TEST_TYPE" in
-    cert|http|adr|hub-connect|all)
+    cert|adr|hub-connect|all)
         ;;
     *)
         echo "Error: Invalid test-type '$TEST_TYPE'"
-        echo "Valid options: cert, http, adr, hub-connect, all"
+        echo "Valid options: cert, adr, hub-connect, all"
         exit 1
         ;;
 esac
@@ -173,9 +172,6 @@ case "$TEST_TYPE" in
     cert)
         check_config "$SCRIPT_DIR/loadtest-configs/cert-user.yaml"
         ;;
-    http)
-        check_config "$SCRIPT_DIR/loadtest-configs/http-user.yaml"
-        ;;
     adr)
         check_config "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
         ;;
@@ -184,7 +180,6 @@ case "$TEST_TYPE" in
         ;;
     all)
         check_config "$SCRIPT_DIR/loadtest-configs/cert-user.yaml"
-        check_config "$SCRIPT_DIR/loadtest-configs/http-user.yaml"
         check_config "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
         check_config "$SCRIPT_DIR/loadtest-configs/cert-hub-connect-user.yaml"
         ;;
@@ -195,9 +190,6 @@ case "$TEST_TYPE" in
     cert)
         deploy_test "cert-user-test" "$SCRIPT_DIR/loadtest-configs/cert-user.yaml"
         ;;
-    http)
-        deploy_test "http-user-test" "$SCRIPT_DIR/loadtest-configs/http-user.yaml"
-        ;;
     adr)
         deploy_test "adr-device-patch-user-test" "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
         ;;
@@ -206,7 +198,6 @@ case "$TEST_TYPE" in
         ;;
     all)
         deploy_test "cert-user-test" "$SCRIPT_DIR/loadtest-configs/cert-user.yaml"
-        deploy_test "http-user-test" "$SCRIPT_DIR/loadtest-configs/http-user.yaml"
         deploy_test "adr-device-patch-user-test" "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
         deploy_test "cert-hub-connect-user-test" "$SCRIPT_DIR/loadtest-configs/cert-hub-connect-user.yaml"
         ;;
@@ -233,9 +224,6 @@ case "$TEST_TYPE" in
     cert)
         echo "  - cert-user-test"
         ;;
-    http)
-        echo "  - http-user-test"
-        ;;
     adr)
         echo "  - adr-device-patch-user-test"
         ;;
@@ -244,7 +232,6 @@ case "$TEST_TYPE" in
         ;;
     all)
         echo "  - cert-user-test"
-        echo "  - http-user-test"
         echo "  - adr-device-patch-user-test"
         echo "  - cert-hub-connect-user-test"
         ;;

@@ -1,6 +1,6 @@
 version: v0.1
 testId: cert-hub-connect-user-test
-displayName: "CertHubConnectUser - Certificate Hub Connection Load Test"
+displayName: "CertHubConnectUser - Provision and connect only"
 description: "Tests certificate-based IoT Hub connections"
 testPlan: ../../src/locust_pkg/cert_hub_connect.py
 testType: Locust
