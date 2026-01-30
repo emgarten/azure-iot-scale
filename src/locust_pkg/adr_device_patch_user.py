@@ -9,6 +9,7 @@ import secrets
 import time
 from typing import Any
 
+import requests
 from locust import User, constant_pacing, task
 
 from adr_utils import create_adr_device, delete_adr_device, get_adr_token, patch_adr_device_os_version
@@ -70,10 +71,16 @@ class AdrDevicePatchUser(User):
             exception: Optional exception if the request failed.
             response_length: Optional response length in bytes.
         """
+        # If exception is an HTTPError with a response, include status code in name
+        event_name = name
+        if exception is not None and isinstance(exception, requests.HTTPError):
+            if exception.response is not None:
+                event_name = f"{name}_{exception.response.status_code}"
+
         response_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         self.environment.events.request.fire(
             request_type="ADR",
-            name=name,
+            name=event_name,
             response_time=response_time,
             response_length=response_length,
             exception=exception,
