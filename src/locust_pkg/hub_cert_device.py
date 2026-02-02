@@ -398,7 +398,7 @@ class HubCertDevice:
 
         try:
             # Derive device key from SAS key using HMAC-SHA256
-            dps_sas_key = config.get("PROVISIONING_SAS_KEY")
+            dps_sas_key = config.get("PROVISIONING_SAS_KEY", log_value=False)
             key_bytes = base64.b64decode(dps_sas_key)
             derived_key = hmac.new(key_bytes, self.device_name.encode("utf-8"), hashlib.sha256).digest()
             device_key = base64.b64encode(derived_key).decode("utf-8")

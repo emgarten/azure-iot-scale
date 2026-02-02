@@ -1,106 +1,29 @@
 import logging
-import os
 import random
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable
 
 import gevent
 import orjson
-import yaml
+
+# Support both import paths: direct (PYTHONPATH=src/locust_pkg) and package (PYTHONPATH=src)
+try:
+    from test_config import TestConfig, config
+except ImportError:
+    from locust_pkg.test_config import TestConfig, config
 
 logger = logging.getLogger("locust.utils")
 
-
-class LazyConfig:
-    """Lazily loads and caches environment variables on first access.
-
-    Falls back to testenv.yaml if environment variables are not set.
-    """
-
-    _yaml_config: dict[str, str] | None = None
-
-    def __init__(self) -> None:
-        self._cache: dict[str, str] = {}
-
-    @classmethod
-    def _load_yaml_config(cls) -> dict[str, str]:
-        """Load testenv.yaml from the same directory as utils.py.
-
-        Returns:
-            Dict mapping variable names to values, or empty dict if file doesn't exist.
-        """
-        if cls._yaml_config is not None:
-            return cls._yaml_config
-
-        config_path = Path(__file__).parent / "testenv.yaml"
-        if not config_path.exists():
-            cls._yaml_config = {}
-            return cls._yaml_config
-
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
-
-        cls._yaml_config = {}
-        if data and "env" in data:
-            for item in data["env"]:
-                if "name" in item and "value" in item:
-                    cls._yaml_config[item["name"]] = str(item["value"])
-
-        return cls._yaml_config
-
-    def _require_env(self, name: str) -> str:
-        """Get required environment variable, falling back to config.yaml.
-
-        Args:
-            name: The name of the environment variable.
-
-        Returns:
-            The value of the environment variable.
-
-        Raises:
-            ValueError: If the environment variable is not set and not in config.yaml.
-        """
-        value = os.getenv(name)
-        if value is not None:
-            return value
-
-        yaml_config = self._load_yaml_config()
-        if name in yaml_config:
-            return yaml_config[name]
-
-        raise ValueError(f"Required environment variable {name} is not set")
-
-    def get(self, name: str) -> str:
-        """Get a required env var, caching the result."""
-        if name not in self._cache:
-            self._cache[name] = self._require_env(name)
-        return self._cache[name]
-
-    def get_int(self, name: str) -> int:
-        """Get a required env var as an integer."""
-        return int(self.get(name))
-
-    def get_bool(self, name: str) -> bool:
-        """Get a required env var as a boolean (true/false string)."""
-        return self.get(name).lower() == "true"
-
-    def get_optional(self, name: str) -> str | None:
-        """Get an optional env var, returning None if not set."""
-        if name not in self._cache:
-            value = os.getenv(name)
-            if value is None:
-                yaml_config = self._load_yaml_config()
-                value = yaml_config.get(name)
-            if value is not None:
-                self._cache[name] = value
-            else:
-                return None
-        return self._cache.get(name)
-
-
-config = LazyConfig()
+# Re-export for backward compatibility
+__all__ = [
+    "TestConfig",
+    "config",
+    "create_msg",
+    "x509_certificate_list_to_pem",
+    "parse_request_id_from_topic",
+    "retry_with_backoff",
+]
 
 
 # Create a message of the given size with the current UTC timestamp

@@ -36,7 +36,7 @@ def get_blob_service_client() -> BlobServiceClient:
     # Slow path: acquire lock and check again (double-checked locking)
     with _blob_service_client_lock:
         if _blob_service_client is None:
-            storage_conn_str = config.get_optional("STORAGE_CONN_STR")
+            storage_conn_str = config.get_optional("STORAGE_CONN_STR", log_value=False)
             storage_account_url = config.get_optional("STORAGE_ACCOUNT_URL")
             if storage_conn_str is not None:
                 _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
