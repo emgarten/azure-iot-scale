@@ -1,9 +1,14 @@
 """Tests for utils.py module."""
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import orjson
+import pytest
 
+from locust_pkg.test_config import TestConfig
 from locust_pkg.utils import create_msg, parse_request_id_from_topic, x509_certificate_list_to_pem
 
 
@@ -324,3 +329,336 @@ class TestParseRequestIdFromTopic:
         topic = "$iothub/credentials/res/200/?foo=bar&$rid=54321&$version=2&other=value"
         result = parse_request_id_from_topic(topic)
         assert result == "54321"
+
+
+class TestConfigClassYamlFallback:
+    """Tests for TestConfig YAML fallback functionality."""
+
+    @pytest.fixture(autouse=True)
+    def reset_yaml_config(self) -> None:
+        """Reset the cached YAML config before each test."""
+        TestConfig._yaml_config = None
+
+    def test_env_var_takes_precedence_over_yaml(self, tmp_path: Path) -> None:
+        """Test that environment variable takes precedence over YAML config."""
+        config = TestConfig()
+        yaml_content = "env:\n  - name: TEST_VAR\n    value: yaml_value\n"
+        config_file = tmp_path / "testenv.yaml"
+        config_file.write_text(yaml_content)
+
+        with patch.dict(os.environ, {"TEST_VAR": "env_value"}):
+            with patch.object(Path, "parent", tmp_path):
+                result = config.get("TEST_VAR")
+
+        assert result == "env_value"
+
+    def test_yaml_fallback_when_env_not_set(self, tmp_path: Path) -> None:
+        """Test that YAML config is used when env var is not set."""
+        TestConfig._yaml_config = None
+        config = TestConfig()
+        yaml_content = "env:\n  - name: YAML_ONLY_VAR\n    value: yaml_value\n"
+
+        # Write testenv.yaml to the locust_pkg directory
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text(yaml_content)
+            TestConfig._yaml_config = None  # Reset cache
+
+            # Ensure the env var is not set
+            env_copy = os.environ.copy()
+            if "YAML_ONLY_VAR" in env_copy:
+                del env_copy["YAML_ONLY_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get("YAML_ONLY_VAR")
+
+            assert result == "yaml_value"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+    def test_error_when_var_not_in_env_or_yaml(self) -> None:
+        """Test that ValueError is raised when var is not in env or YAML."""
+        TestConfig._yaml_config = None
+        config = TestConfig()
+
+        # Create an empty YAML config
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env: []\n")
+            TestConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "NONEXISTENT_VAR" in env_copy:
+                del env_copy["NONEXISTENT_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                with pytest.raises(ValueError, match="Required environment variable NONEXISTENT_VAR is not set"):
+                    config.get("NONEXISTENT_VAR")
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+    def test_yaml_config_caching(self) -> None:
+        """Test that YAML config is loaded only once and cached."""
+        TestConfig._yaml_config = None
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env:\n  - name: CACHE_TEST\n    value: cached\n")
+            TestConfig._yaml_config = None
+
+            # First load
+            result1 = TestConfig._load_yaml_config()
+            # Second load should return cached value
+            result2 = TestConfig._load_yaml_config()
+
+            assert result1 is result2
+            assert result1.get("CACHE_TEST") == "cached"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+    def test_yaml_missing_file_returns_empty_dict(self) -> None:
+        """Test that missing testenv.yaml returns empty dict."""
+        TestConfig._yaml_config = None
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+            config_path.unlink()
+
+        try:
+            TestConfig._yaml_config = None
+            result = TestConfig._load_yaml_config()
+            assert result == {}
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            TestConfig._yaml_config = None
+
+    def test_get_optional_with_yaml_fallback(self) -> None:
+        """Test that get_optional also falls back to YAML config."""
+        TestConfig._yaml_config = None
+        config = TestConfig()
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env:\n  - name: OPTIONAL_YAML_VAR\n    value: optional_value\n")
+            TestConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "OPTIONAL_YAML_VAR" in env_copy:
+                del env_copy["OPTIONAL_YAML_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get_optional("OPTIONAL_YAML_VAR")
+
+            assert result == "optional_value"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+    def test_get_optional_returns_none_when_not_found(self) -> None:
+        """Test that get_optional returns None when var is not in env or YAML."""
+        TestConfig._yaml_config = None
+        config = TestConfig()
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env: []\n")
+            TestConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "MISSING_OPTIONAL_VAR" in env_copy:
+                del env_copy["MISSING_OPTIONAL_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get_optional("MISSING_OPTIONAL_VAR")
+
+            assert result is None
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+    def test_yaml_value_converted_to_string(self) -> None:
+        """Test that YAML values are converted to strings."""
+        TestConfig._yaml_config = None
+        config = TestConfig()
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            # Use an integer value in YAML
+            config_path.write_text("env:\n  - name: INT_VAR\n    value: 12345\n")
+            TestConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "INT_VAR" in env_copy:
+                del env_copy["INT_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get("INT_VAR")
+
+            assert result == "12345"
+            assert isinstance(result, str)
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+
+class TestConfigLogging:
+    """Tests for TestConfig logging functionality."""
+
+    @pytest.fixture(autouse=True)
+    def reset_yaml_config(self) -> None:
+        """Reset the cached YAML config before each test."""
+        TestConfig._yaml_config = None
+
+    def test_logs_value_on_first_access(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that the value is logged on first access when log_value=True."""
+        import logging
+
+        config = TestConfig()
+        with patch.dict(os.environ, {"LOG_TEST_VAR": "test_value"}):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get("LOG_TEST_VAR", log_value=True)
+
+        assert "Config LOG_TEST_VAR: test_value" in caplog.text
+
+    def test_logs_set_when_log_value_false(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that 'set' is logged instead of value when log_value=False."""
+        import logging
+
+        config = TestConfig()
+        with patch.dict(os.environ, {"SECRET_VAR": "secret_password"}):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get("SECRET_VAR", log_value=False)
+
+        assert "Config SECRET_VAR: set" in caplog.text
+        assert "secret_password" not in caplog.text
+
+    def test_logs_unset_for_optional_missing_var(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that 'unset' is logged for missing optional variable."""
+        import logging
+
+        config = TestConfig()
+        TestConfig._yaml_config = {}
+        env_copy = {k: v for k, v in os.environ.items() if k != "MISSING_VAR"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get_optional("MISSING_VAR")
+
+        assert "Config MISSING_VAR: unset" in caplog.text
+
+    def test_logs_only_once_per_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that each key is only logged once."""
+        import logging
+
+        config = TestConfig()
+        with patch.dict(os.environ, {"REPEATED_VAR": "value"}):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get("REPEATED_VAR")
+                caplog.clear()
+                config.get("REPEATED_VAR")
+
+        # Second access should not log
+        assert "Config REPEATED_VAR" not in caplog.text
+
+    def test_get_int_respects_log_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that get_int respects the log_value parameter."""
+        import logging
+
+        config = TestConfig()
+        with patch.dict(os.environ, {"INT_VAR": "42"}):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get_int("INT_VAR", log_value=False)
+
+        assert "Config INT_VAR: set" in caplog.text
+        assert "42" not in caplog.text
+
+    def test_get_bool_respects_log_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that get_bool respects the log_value parameter."""
+        import logging
+
+        config = TestConfig()
+        with patch.dict(os.environ, {"BOOL_VAR": "true"}):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get_bool("BOOL_VAR", log_value=True)
+
+        assert "Config BOOL_VAR: true" in caplog.text
+
+    def test_get_optional_respects_log_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that get_optional respects the log_value parameter."""
+        import logging
+
+        config = TestConfig()
+        with patch.dict(os.environ, {"OPT_VAR": "optional_value"}):
+            with caplog.at_level(logging.INFO, logger="locust.test_config"):
+                config.get_optional("OPT_VAR", log_value=False)
+
+        assert "Config OPT_VAR: set" in caplog.text
+        assert "optional_value" not in caplog.text

@@ -5,7 +5,6 @@ requesting certificate renewals in a round-robin fashion across all connected de
 """
 
 import logging
-import os
 import sys
 import tempfile
 import threading
@@ -14,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from locust import User, constant_pacing, events, task
+
+from utils import config
 
 # Load the azure-iot-device wheel if present
 wheel_path = Path("azure_iot_device-2.14.0-py3-none-any.whl")
@@ -38,13 +39,6 @@ def on_test_stop(environment: Any, **kwargs: Any) -> None:
     clear_device_counter()
 
 
-# Environment configuration
-cert_request_interval = int(os.getenv("CERT_REQUEST_INTERVAL", "90"))  # seconds
-device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
-devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
-cert_replace_enabled = os.getenv("CERT_REPLACE_ENABLED", "false").lower() == "true"
-
-
 class CertUser(User):
     """Locust user that manages multiple IoT Hub devices.
 
@@ -59,8 +53,14 @@ class CertUser(User):
         DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 2500)
     """
 
-    wait_time = constant_pacing(cert_request_interval / devices_per_user)  # type: ignore[no-untyped-call]
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
+
+    def wait_time(self) -> float:
+        """Calculate wait time between tasks using lazy config."""
+        interval = config.get_int("CERT_REQUEST_INTERVAL")
+        devices = config.get_int("DEVICES_PER_USER")
+        result: float = constant_pacing(interval / devices)(self)  # type: ignore[no-untyped-call]
+        return result
 
     # Distributed device ID range allocation (per-worker, shared across all CertUser instances)
     _id_range_lock: threading.Lock = threading.Lock()  # Lock for thread-safe ID range allocation
@@ -83,6 +83,7 @@ class CertUser(User):
         Note: Caller must hold _id_range_lock before calling this method.
         """
         if cls._id_range_current >= cls._id_range_end:
+            device_name_prefix = config.get("DEVICE_NAME_PREFIX")
             logger.info(f"Allocating new device ID range for prefix '{device_name_prefix}'")
             cls._id_range_start, cls._id_range_end = allocate_device_id_range(device_name_prefix)
             cls._id_range_current = cls._id_range_start
@@ -107,7 +108,7 @@ class CertUser(User):
             cls._ensure_id_range_unlocked()
             device_id = cls._id_range_current
             cls._id_range_current += 1
-        device_name = f"{device_name_prefix}{device_id}"
+        device_name = f"{config.get('DEVICE_NAME_PREFIX')}{device_id}"
         logger.info(f"Generated device name: {device_name}")
         return device_name
 
@@ -124,6 +125,7 @@ class CertUser(User):
         self.devices: list[HubCertDevice] = []
         self._current_device_index: int = 0  # For round-robin message sending
 
+        devices_per_user = config.get_int("DEVICES_PER_USER")
         logger.info(f"Starting CertUser with {devices_per_user} device(s)")
 
         # Create device instances only - provisioning and connecting happens lazily in request_certificate
@@ -218,7 +220,7 @@ class CertUser(User):
             logger.debug(f"Device {device.device_name} not provisioned, skipping")
             return
 
-        device.request_new_certificate(replace=cert_replace_enabled)
+        device.request_new_certificate(replace=config.get_bool("CERT_REPLACE_ENABLED"))
 
     def on_stop(self) -> None:
         """Cleanup method called when the user stops."""

@@ -5,46 +5,17 @@ patches the operatingSystemVersion field to measure latency and throughput.
 """
 
 import logging
-import os
 import secrets
 import time
 from typing import Any
 
+import requests
 from locust import User, constant_pacing, task
 
 from adr_utils import create_adr_device, delete_adr_device, get_adr_token, patch_adr_device_os_version
+from utils import config
 
 logger = logging.getLogger("locust.adr_device_patch_user")
-
-# Environment configuration (required)
-adr_subscription_id = os.getenv("ADR_SUBSCRIPTION_ID", "")
-adr_resource_group = os.getenv("ADR_RESOURCE_GROUP", "")
-adr_namespace = os.getenv("ADR_NAMESPACE", "")
-adr_location = os.getenv("ADR_LOCATION", "")
-
-# Environment configuration (optional)
-adr_device_prefix = os.getenv("ADR_DEVICE_PREFIX", "device")
-adr_patch_interval = int(os.getenv("ADR_PATCH_INTERVAL", "5"))  # seconds
-
-
-def _validate_required_env_vars() -> None:
-    """Validate that all required environment variables are set.
-
-    Raises:
-        ValueError: If any required environment variable is missing.
-    """
-    missing = []
-    if not adr_subscription_id:
-        missing.append("ADR_SUBSCRIPTION_ID")
-    if not adr_resource_group:
-        missing.append("ADR_RESOURCE_GROUP")
-    if not adr_namespace:
-        missing.append("ADR_NAMESPACE")
-    if not adr_location:
-        missing.append("ADR_LOCATION")
-
-    if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
 
 class AdrDevicePatchUser(User):
@@ -62,17 +33,17 @@ class AdrDevicePatchUser(User):
         ADR_PATCH_INTERVAL (optional): Seconds between patches (default: 5)
     """
 
-    wait_time = constant_pacing(adr_patch_interval)  # type: ignore[no-untyped-call]
+    def wait_time(self) -> float:
+        """Calculate wait time between tasks using lazy config."""
+        result: float = constant_pacing(config.get_int("ADR_PATCH_INTERVAL"))(self)  # type: ignore[no-untyped-call]
+        return result
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-        # Validate environment variables
-        _validate_required_env_vars()
-
         # Generate unique device name with random hex suffix
         suffix = secrets.token_hex(4)  # 8 hex characters
-        self.device_name = f"{adr_device_prefix}-{suffix}"
+        self.device_name = f"{config.get('ADR_DEVICE_PREFIX')}-{suffix}"
         self._device_created = False
 
         logger.info(f"Initialized AdrDevicePatchUser with device: {self.device_name}")
@@ -92,10 +63,16 @@ class AdrDevicePatchUser(User):
             exception: Optional exception if the request failed.
             response_length: Optional response length in bytes.
         """
+        # If exception is an HTTPError with a response, include status code in name
+        event_name = name
+        if exception is not None and isinstance(exception, requests.HTTPError):
+            if exception.response is not None:
+                event_name = f"{name}_{exception.response.status_code}"
+
         response_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         self.environment.events.request.fire(
             request_type="ADR",
-            name=name,
+            name=event_name,
             response_time=response_time,
             response_length=response_length,
             exception=exception,
@@ -115,11 +92,11 @@ class AdrDevicePatchUser(User):
             get_adr_token()
 
             create_adr_device(
-                subscription_id=adr_subscription_id,
-                resource_group=adr_resource_group,
-                namespace=adr_namespace,
+                subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
+                resource_group=config.get("ADR_RESOURCE_GROUP"),
+                namespace=config.get("ADR_NAMESPACE"),
                 device_name=self.device_name,
-                location=adr_location,
+                location=config.get("ADR_LOCATION"),
             )
             self._device_created = True
             self._fire_request_event("create_device", start_time)
@@ -144,9 +121,9 @@ class AdrDevicePatchUser(User):
 
         try:
             _, os_version = patch_adr_device_os_version(
-                subscription_id=adr_subscription_id,
-                resource_group=adr_resource_group,
-                namespace=adr_namespace,
+                subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
+                resource_group=config.get("ADR_RESOURCE_GROUP"),
+                namespace=config.get("ADR_NAMESPACE"),
                 device_name=self.device_name,
             )
             self._fire_request_event("patch_device", start_time)
@@ -170,9 +147,9 @@ class AdrDevicePatchUser(User):
 
         try:
             delete_adr_device(
-                subscription_id=adr_subscription_id,
-                resource_group=adr_resource_group,
-                namespace=adr_namespace,
+                subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
+                resource_group=config.get("ADR_RESOURCE_GROUP"),
+                namespace=config.get("ADR_NAMESPACE"),
                 device_name=self.device_name,
             )
             self._fire_request_event("delete_device", start_time)

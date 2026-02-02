@@ -33,19 +33,13 @@ from cryptography.x509.oid import NameOID
 from storage import delete_device_data as _delete_device_data
 from storage import load_device_data as _load_device_data
 from storage import save_device_data as _save_device_data
-from utils import parse_request_id_from_topic, retry_with_backoff, x509_certificate_list_to_pem
+from utils import config, parse_request_id_from_topic, retry_with_backoff, x509_certificate_list_to_pem
 
 logger = logging.getLogger("locust.hub_cert_device")
-
-# Environment configuration
-provisioning_host = os.getenv("PROVISIONING_HOST")
-id_scope = os.getenv("PROVISIONING_IDSCOPE")
-dps_sas_key = os.getenv("PROVISIONING_SAS_KEY")
 
 # MQTT configuration for credential management
 MQTT_PORT = 8883
 API_VERSION = "2025-08-01-preview"
-credential_response_timeout = int(os.getenv("CREDENTIAL_RESPONSE_TIMEOUT", "300"))  # Default 5 minutes
 
 
 class RegistrationState:
@@ -403,29 +397,19 @@ class HubCertDevice:
         start_time = time.time()
 
         try:
-            device_key: str = ""
+            # Derive device key from SAS key using HMAC-SHA256
+            dps_sas_key = config.get("PROVISIONING_SAS_KEY", log_value=False)
+            key_bytes = base64.b64decode(dps_sas_key)
+            derived_key = hmac.new(key_bytes, self.device_name.encode("utf-8"), hashlib.sha256).digest()
+            device_key = base64.b64encode(derived_key).decode("utf-8")
 
-            # Handle optional dps_sas_key
-            if dps_sas_key is not None:
-                key_bytes = base64.b64decode(dps_sas_key)
-                derived_key = hmac.new(key_bytes, self.device_name.encode("utf-8"), hashlib.sha256).digest()
-                device_key = base64.b64encode(derived_key).decode("utf-8")
-
-            if device_key:
-                logger.debug("Using symmetric-key authentication")
-                # Validate required environment variables
-                if provisioning_host is None or id_scope is None:
-                    raise Exception("Missing required environment variables: PROVISIONING_HOST or PROVISIONING_IDSCOPE")
-                provisioning_device_client = ProvisioningDeviceClient.create_from_symmetric_key(
-                    provisioning_host=provisioning_host,
-                    registration_id=self.device_name,
-                    id_scope=id_scope,
-                    symmetric_key=device_key,
-                )
-            else:
-                raise Exception(
-                    "Either provide PROVISIONING_X509_CERT_FILE and PROVISIONING_X509_KEY_FILE or PROVISIONING_SAS_KEY"
-                )
+            logger.debug("Using symmetric-key authentication")
+            provisioning_device_client = ProvisioningDeviceClient.create_from_symmetric_key(
+                provisioning_host=config.get("PROVISIONING_HOST"),
+                registration_id=self.device_name,
+                id_scope=config.get("PROVISIONING_IDSCOPE"),
+                symmetric_key=device_key,
+            )
 
             # Generate CSR (Certificate Signing Request) using the existing private key
             csr_builder = x509.CertificateSigningRequestBuilder()

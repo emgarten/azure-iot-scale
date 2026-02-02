@@ -7,7 +7,23 @@ from typing import Any, Callable
 import gevent
 import orjson
 
+# Support both import paths: direct (PYTHONPATH=src/locust_pkg) and package (PYTHONPATH=src)
+try:
+    from test_config import TestConfig, config
+except ImportError:
+    from locust_pkg.test_config import TestConfig, config
+
 logger = logging.getLogger("locust.utils")
+
+# Re-export for backward compatibility
+__all__ = [
+    "TestConfig",
+    "config",
+    "create_msg",
+    "x509_certificate_list_to_pem",
+    "parse_request_id_from_topic",
+    "retry_with_backoff",
+]
 
 
 # Create a message of the given size with the current UTC timestamp
