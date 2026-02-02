@@ -15,7 +15,7 @@ from typing import Any
 
 from locust import User, constant_pacing, events, task
 
-from utils import log_all_env_vars, require_env
+from utils import config
 
 # Load the azure-iot-device wheel if present
 wheel_path = Path("azure_iot_device-2.14.0-py3-none-any.whl")
@@ -31,14 +31,6 @@ from hub_cert_device import HubCertDevice  # noqa: E402
 from storage import allocate_device_id_range, clear_device_counter, initialize_storage  # noqa: E402
 
 logger = logging.getLogger("locust.cert_hub_connect")
-
-# Log all environment variables for debugging
-log_all_env_vars()
-
-# Environment configuration (all required)
-connect_request_interval = int(require_env("CONNECT_REQUEST_INTERVAL"))  # seconds
-device_name_prefix = require_env("DEVICE_NAME_PREFIX")
-devices_per_user = int(require_env("DEVICES_PER_USER"))  # number of devices per user
 
 
 @events.test_stop.add_listener  # type: ignore[misc]
@@ -62,8 +54,14 @@ class CertHubConnectUser(User):
         DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 2500)
     """
 
-    wait_time = constant_pacing(connect_request_interval / devices_per_user)  # type: ignore[no-untyped-call]
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
+
+    def wait_time(self) -> float:
+        """Calculate wait time between tasks using lazy config."""
+        interval = config.get_int("CONNECT_REQUEST_INTERVAL")
+        devices = config.get_int("DEVICES_PER_USER")
+        result: float = constant_pacing(interval / devices)(self)  # type: ignore[no-untyped-call]
+        return result
 
     # Distributed device ID range allocation (per-worker, shared across all CertHubConnectUser instances)
     _id_range_lock: threading.Lock = threading.Lock()  # Lock for thread-safe ID range allocation
@@ -86,6 +84,7 @@ class CertHubConnectUser(User):
         Note: Caller must hold _id_range_lock before calling this method.
         """
         if cls._id_range_current >= cls._id_range_end:
+            device_name_prefix = config.get("DEVICE_NAME_PREFIX")
             logger.info(f"Allocating new device ID range for prefix '{device_name_prefix}'")
             cls._id_range_start, cls._id_range_end = allocate_device_id_range(device_name_prefix)
             cls._id_range_current = cls._id_range_start
@@ -110,7 +109,7 @@ class CertHubConnectUser(User):
             cls._ensure_id_range_unlocked()
             device_id = cls._id_range_current
             cls._id_range_current += 1
-        device_name = f"{device_name_prefix}{device_id}"
+        device_name = f"{config.get('DEVICE_NAME_PREFIX')}{device_id}"
         logger.info(f"Generated device name: {device_name}")
         return device_name
 
@@ -127,6 +126,7 @@ class CertHubConnectUser(User):
         self.devices: list[HubCertDevice] = []
         self._current_device_index: int = 0  # For round-robin device selection
 
+        devices_per_user = config.get_int("DEVICES_PER_USER")
         logger.info(f"Starting CertHubConnectUser with {devices_per_user} device(s)")
 
         # Create device instances only - provisioning happens lazily in connect_disconnect task

@@ -1,5 +1,4 @@
 import logging
-import os
 import random
 import threading
 from typing import Any, Optional
@@ -11,22 +10,9 @@ from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, Re
 from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
-from utils import require_env
+from utils import config
 
 logger = logging.getLogger("locust.storage")
-
-# Storage authentication (in order of preference):
-# 1. STORAGE_CONN_STR - Connection string for the storage account
-# 2. STORAGE_ACCOUNT_URL - Account URL (e.g., https://<account>.blob.core.windows.net)
-#    with DefaultAzureCredential (managed identity, Azure CLI, etc.)
-# At least one must be set, otherwise an exception is raised in get_blob_service_client().
-storage_conn_str = os.getenv("STORAGE_CONN_STR")
-storage_account_url = os.getenv("STORAGE_ACCOUNT_URL")
-storage_container_name = require_env("STORAGE_CONTAINER_NAME")
-counter_blob_prefix = require_env("COUNTER_BLOB_PREFIX")
-device_data_blob_prefix = require_env("DEVICE_DATA_BLOB_PREFIX")
-device_id_range_size = int(require_env("DEVICE_ID_RANGE_SIZE"))
-device_name_prefix = require_env("DEVICE_NAME_PREFIX")
 
 # Global BlobServiceClient singleton with thread-safe initialization
 _blob_service_client: Optional[BlobServiceClient] = None
@@ -50,6 +36,8 @@ def get_blob_service_client() -> BlobServiceClient:
     # Slow path: acquire lock and check again (double-checked locking)
     with _blob_service_client_lock:
         if _blob_service_client is None:
+            storage_conn_str = config.get_optional("STORAGE_CONN_STR")
+            storage_account_url = config.get_optional("STORAGE_ACCOUNT_URL")
             if storage_conn_str is not None:
                 _blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
             elif storage_account_url is not None:
@@ -78,6 +66,7 @@ def initialize_storage(blob_service_client: Optional[BlobServiceClient] = None) 
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
 
+    storage_container_name = config.get("STORAGE_CONTAINER_NAME")
     try:
         # Create the main container if it doesn't exist
         container_client = blob_service_client.get_container_client(storage_container_name)
@@ -109,8 +98,8 @@ def save_device_data(
     try:
         if blob_service_client is None:
             blob_service_client = get_blob_service_client()
-        container_client = blob_service_client.get_container_client(storage_container_name)
-        blob_name = f"{device_data_blob_prefix}/{device_name}/registration.json"
+        container_client = blob_service_client.get_container_client(config.get("STORAGE_CONTAINER_NAME"))
+        blob_name = f"{config.get('DEVICE_DATA_BLOB_PREFIX')}/{device_name}/registration.json"
         blob_client = container_client.get_blob_client(blob_name)
 
         # Serialize to JSON
@@ -153,8 +142,8 @@ def load_device_data(
     try:
         if blob_service_client is None:
             blob_service_client = get_blob_service_client()
-        container_client = blob_service_client.get_container_client(storage_container_name)
-        blob_name = f"{device_data_blob_prefix}/{device_name}/registration.json"
+        container_client = blob_service_client.get_container_client(config.get("STORAGE_CONTAINER_NAME"))
+        blob_name = f"{config.get('DEVICE_DATA_BLOB_PREFIX')}/{device_name}/registration.json"
         blob_client = container_client.get_blob_client(blob_name)
 
         # Check if blob exists
@@ -193,8 +182,8 @@ def delete_device_data(
     try:
         if blob_service_client is None:
             blob_service_client = get_blob_service_client()
-        container_client = blob_service_client.get_container_client(storage_container_name)
-        blob_name = f"{device_data_blob_prefix}/{device_name}/registration.json"
+        container_client = blob_service_client.get_container_client(config.get("STORAGE_CONTAINER_NAME"))
+        blob_name = f"{config.get('DEVICE_DATA_BLOB_PREFIX')}/{device_name}/registration.json"
         blob_client = container_client.get_blob_client(blob_name)
 
         if blob_client.exists():
@@ -230,14 +219,14 @@ def allocate_device_id_range(
         Exception: If allocation fails after max_retries attempts.
     """
     if device_prefix is None:
-        device_prefix = device_name_prefix
+        device_prefix = config.get("DEVICE_NAME_PREFIX")
     if range_size is None:
-        range_size = device_id_range_size
+        range_size = config.get_int("DEVICE_ID_RANGE_SIZE")
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
 
-    container_client = blob_service_client.get_container_client(storage_container_name)
-    blob_name = f"{counter_blob_prefix}/{device_prefix}/counter.json"
+    container_client = blob_service_client.get_container_client(config.get("STORAGE_CONTAINER_NAME"))
+    blob_name = f"{config.get('COUNTER_BLOB_PREFIX')}/{device_prefix}/counter.json"
     blob_client = container_client.get_blob_client(blob_name)
 
     for attempt in range(max_retries):
@@ -312,13 +301,13 @@ def clear_device_counter(
         True if the counter was cleared, False if it didn't exist.
     """
     if device_prefix is None:
-        device_prefix = device_name_prefix
+        device_prefix = config.get("DEVICE_NAME_PREFIX")
     if blob_service_client is None:
         blob_service_client = get_blob_service_client()
 
     try:
-        container_client = blob_service_client.get_container_client(storage_container_name)
-        blob_name = f"{counter_blob_prefix}/{device_prefix}/counter.json"
+        container_client = blob_service_client.get_container_client(config.get("STORAGE_CONTAINER_NAME"))
+        blob_name = f"{config.get('COUNTER_BLOB_PREFIX')}/{device_prefix}/counter.json"
         blob_client = container_client.get_blob_client(blob_name)
 
         if blob_client.exists():
@@ -349,8 +338,8 @@ def list_device_counters(
         blob_service_client = get_blob_service_client()
 
     try:
-        container_client = blob_service_client.get_container_client(storage_container_name)
-        prefix = f"{counter_blob_prefix}/"
+        container_client = blob_service_client.get_container_client(config.get("STORAGE_CONTAINER_NAME"))
+        prefix = f"{config.get('COUNTER_BLOB_PREFIX')}/"
         device_prefixes = []
 
         for blob in container_client.list_blobs(name_starts_with=prefix):

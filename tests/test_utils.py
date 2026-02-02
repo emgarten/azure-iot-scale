@@ -1,10 +1,14 @@
 """Tests for utils.py module."""
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import orjson
+import pytest
 
-from locust_pkg.utils import create_msg, parse_request_id_from_topic, x509_certificate_list_to_pem
+from locust_pkg.utils import LazyConfig, create_msg, parse_request_id_from_topic, x509_certificate_list_to_pem
 
 
 class TestCreateMsg:
@@ -324,3 +328,242 @@ class TestParseRequestIdFromTopic:
         topic = "$iothub/credentials/res/200/?foo=bar&$rid=54321&$version=2&other=value"
         result = parse_request_id_from_topic(topic)
         assert result == "54321"
+
+
+class TestLazyConfigYamlFallback:
+    """Tests for LazyConfig YAML fallback functionality."""
+
+    @pytest.fixture(autouse=True)
+    def reset_yaml_config(self) -> None:
+        """Reset the cached YAML config before each test."""
+        LazyConfig._yaml_config = None
+
+    def test_env_var_takes_precedence_over_yaml(self, tmp_path: Path) -> None:
+        """Test that environment variable takes precedence over YAML config."""
+        config = LazyConfig()
+        yaml_content = "env:\n  - name: TEST_VAR\n    value: yaml_value\n"
+        config_file = tmp_path / "testenv.yaml"
+        config_file.write_text(yaml_content)
+
+        with patch.dict(os.environ, {"TEST_VAR": "env_value"}):
+            with patch.object(Path, "parent", tmp_path):
+                result = config.get("TEST_VAR")
+
+        assert result == "env_value"
+
+    def test_yaml_fallback_when_env_not_set(self, tmp_path: Path) -> None:
+        """Test that YAML config is used when env var is not set."""
+        LazyConfig._yaml_config = None
+        config = LazyConfig()
+        yaml_content = "env:\n  - name: YAML_ONLY_VAR\n    value: yaml_value\n"
+
+        # Write testenv.yaml to the locust_pkg directory
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text(yaml_content)
+            LazyConfig._yaml_config = None  # Reset cache
+
+            # Ensure the env var is not set
+            env_copy = os.environ.copy()
+            if "YAML_ONLY_VAR" in env_copy:
+                del env_copy["YAML_ONLY_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get("YAML_ONLY_VAR")
+
+            assert result == "yaml_value"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            LazyConfig._yaml_config = None
+
+    def test_error_when_var_not_in_env_or_yaml(self) -> None:
+        """Test that ValueError is raised when var is not in env or YAML."""
+        LazyConfig._yaml_config = None
+        config = LazyConfig()
+
+        # Create an empty YAML config
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env: []\n")
+            LazyConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "NONEXISTENT_VAR" in env_copy:
+                del env_copy["NONEXISTENT_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                with pytest.raises(ValueError, match="Required environment variable NONEXISTENT_VAR is not set"):
+                    config.get("NONEXISTENT_VAR")
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            LazyConfig._yaml_config = None
+
+    def test_yaml_config_caching(self) -> None:
+        """Test that YAML config is loaded only once and cached."""
+        LazyConfig._yaml_config = None
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env:\n  - name: CACHE_TEST\n    value: cached\n")
+            LazyConfig._yaml_config = None
+
+            # First load
+            result1 = LazyConfig._load_yaml_config()
+            # Second load should return cached value
+            result2 = LazyConfig._load_yaml_config()
+
+            assert result1 is result2
+            assert result1.get("CACHE_TEST") == "cached"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            LazyConfig._yaml_config = None
+
+    def test_yaml_missing_file_returns_empty_dict(self) -> None:
+        """Test that missing testenv.yaml returns empty dict."""
+        LazyConfig._yaml_config = None
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+            config_path.unlink()
+
+        try:
+            LazyConfig._yaml_config = None
+            result = LazyConfig._load_yaml_config()
+            assert result == {}
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            LazyConfig._yaml_config = None
+
+    def test_get_optional_with_yaml_fallback(self) -> None:
+        """Test that get_optional also falls back to YAML config."""
+        LazyConfig._yaml_config = None
+        config = LazyConfig()
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env:\n  - name: OPTIONAL_YAML_VAR\n    value: optional_value\n")
+            LazyConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "OPTIONAL_YAML_VAR" in env_copy:
+                del env_copy["OPTIONAL_YAML_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get_optional("OPTIONAL_YAML_VAR")
+
+            assert result == "optional_value"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            LazyConfig._yaml_config = None
+
+    def test_get_optional_returns_none_when_not_found(self) -> None:
+        """Test that get_optional returns None when var is not in env or YAML."""
+        LazyConfig._yaml_config = None
+        config = LazyConfig()
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env: []\n")
+            LazyConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "MISSING_OPTIONAL_VAR" in env_copy:
+                del env_copy["MISSING_OPTIONAL_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get_optional("MISSING_OPTIONAL_VAR")
+
+            assert result is None
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            LazyConfig._yaml_config = None
+
+    def test_yaml_value_converted_to_string(self) -> None:
+        """Test that YAML values are converted to strings."""
+        LazyConfig._yaml_config = None
+        config = LazyConfig()
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            # Use an integer value in YAML
+            config_path.write_text("env:\n  - name: INT_VAR\n    value: 12345\n")
+            LazyConfig._yaml_config = None
+
+            env_copy = os.environ.copy()
+            if "INT_VAR" in env_copy:
+                del env_copy["INT_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                result = config.get("INT_VAR")
+
+            assert result == "12345"
+            assert isinstance(result, str)
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            LazyConfig._yaml_config = None

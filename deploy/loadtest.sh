@@ -132,12 +132,15 @@ deploy_test() {
             --load-test-config-file "$config_file"
     fi
 
-    # Upload all Python files from locust_pkg (except the test plan file)
+    # Upload all Python files from locust_pkg (except the test plan file and __init__.py)
     for file in "$PROJECT_ROOT"/src/locust_pkg/*.py; do
         local filename
         filename=$(basename "$file")
         if [ "$filename" = "$test_plan_file" ]; then
             echo "Skipping $filename (already uploaded as test plan)"
+            continue
+        fi
+        if [ "$filename" = "__init__.py" ]; then
             continue
         fi
         az load test file upload \
@@ -163,6 +166,16 @@ deploy_test() {
         --test-id "$test_id" \
         --path "$PROJECT_ROOT/dist/azure_iot_device-2.14.0-py3-none-any.whl" \
         --file-type ADDITIONAL_ARTIFACTS
+
+    # Upload config file as testenv.yaml for LazyConfig fallback
+    cp "$config_file" "$SCRIPT_DIR/loadtest-configs/testenv.yaml"
+    az load test file upload \
+        --load-test-resource "$LOADTEST_NAME" \
+        --resource-group "$RESOURCE_GROUP" \
+        --test-id "$test_id" \
+        --path "$SCRIPT_DIR/loadtest-configs/testenv.yaml" \
+        --file-type ADDITIONAL_ARTIFACTS
+    rm "$SCRIPT_DIR/loadtest-configs/testenv.yaml"
 
     echo "Test $test_id deployed successfully"
 }
