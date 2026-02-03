@@ -17,8 +17,8 @@ Copy the example files to create your local config files:
 
 ```bash
 cp deploy/loadtest-configs/cert-user.yaml.example deploy/loadtest-configs/cert-user.yaml
-cp deploy/loadtest-configs/http-user.yaml.example deploy/loadtest-configs/http-user.yaml
 cp deploy/loadtest-configs/adr-device-patch-user.yaml.example deploy/loadtest-configs/adr-device-patch-user.yaml
+cp deploy/loadtest-configs/adr-user.yaml.example deploy/loadtest-configs/adr-user.yaml
 cp deploy/loadtest-configs/cert-hub-connect-user.yaml.example deploy/loadtest-configs/cert-hub-connect-user.yaml
 ```
 
@@ -29,8 +29,8 @@ Then edit the `.yaml` files with your specific settings (engine instances, envir
 | File | Description |
 |------|-------------|
 | `cert-user.yaml` | CertUser - Certificate renewal load test against Azure IoT Hub and DPS |
-| `http-user.yaml` | BasicHttpUser - Simple HTTP endpoint load test |
 | `adr-device-patch-user.yaml` | AdrDevicePatchUser - ADR device patch operations load test |
+| `adr-user.yaml` | AdrUser - ADR GET/PATCH operations with distributed device allocation |
 | `cert-hub-connect-user.yaml` | CertHubConnectUser - Certificate-based IoT Hub connection load test |
 
 ## Notes

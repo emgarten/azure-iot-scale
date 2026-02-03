@@ -471,6 +471,85 @@ class TestConfigClassYamlFallback:
                 config_path.write_text(original_content)
             TestConfig._yaml_config = None
 
+    def test_scale_config_path_used_when_set_and_exists(self, tmp_path: Path) -> None:
+        """Test that SCALE_CONFIG_PATH is used when set and file exists."""
+        TestConfig._yaml_config = None
+
+        custom_config = tmp_path / "custom_config.yaml"
+        custom_config.write_text("env:\n  - name: CUSTOM_VAR\n    value: custom_value\n")
+
+        env_copy = os.environ.copy()
+        env_copy["SCALE_CONFIG_PATH"] = str(custom_config)
+        if "CUSTOM_VAR" in env_copy:
+            del env_copy["CUSTOM_VAR"]
+
+        try:
+            with patch.dict(os.environ, env_copy, clear=True):
+                TestConfig._yaml_config = None
+                result = TestConfig._load_yaml_config()
+                assert result.get("CUSTOM_VAR") == "custom_value"
+        finally:
+            TestConfig._yaml_config = None
+
+    def test_scale_config_path_falls_back_when_file_not_exists(self) -> None:
+        """Test that default path is used when SCALE_CONFIG_PATH file doesn't exist."""
+        TestConfig._yaml_config = None
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env:\n  - name: DEFAULT_VAR\n    value: default_value\n")
+
+            env_copy = os.environ.copy()
+            env_copy["SCALE_CONFIG_PATH"] = "/nonexistent/path/config.yaml"
+            if "DEFAULT_VAR" in env_copy:
+                del env_copy["DEFAULT_VAR"]
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                TestConfig._yaml_config = None
+                result = TestConfig._load_yaml_config()
+                assert result.get("DEFAULT_VAR") == "default_value"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
+    def test_scale_config_path_not_set_uses_default(self) -> None:
+        """Test that default path is used when SCALE_CONFIG_PATH is not set."""
+        TestConfig._yaml_config = None
+
+        import locust_pkg.utils as utils_module
+
+        config_path = Path(utils_module.__file__).parent / "testenv.yaml"
+        original_exists = config_path.exists()
+        original_content = None
+        if original_exists:
+            original_content = config_path.read_text()
+
+        try:
+            config_path.write_text("env:\n  - name: FALLBACK_VAR\n    value: fallback_value\n")
+
+            env_copy = {k: v for k, v in os.environ.items() if k not in ("SCALE_CONFIG_PATH", "FALLBACK_VAR")}
+
+            with patch.dict(os.environ, env_copy, clear=True):
+                TestConfig._yaml_config = None
+                result = TestConfig._load_yaml_config()
+                assert result.get("FALLBACK_VAR") == "fallback_value"
+        finally:
+            if original_exists and original_content:
+                config_path.write_text(original_content)
+            elif config_path.exists():
+                config_path.unlink()
+            TestConfig._yaml_config = None
+
     def test_get_optional_with_yaml_fallback(self) -> None:
         """Test that get_optional also falls back to YAML config."""
         TestConfig._yaml_config = None

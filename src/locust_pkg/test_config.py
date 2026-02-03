@@ -22,7 +22,10 @@ class TestConfig:
 
     @classmethod
     def _load_yaml_config(cls) -> dict[str, str]:
-        """Load testenv.yaml from the same directory as test_config.py.
+        """Load config YAML, checking SCALE_CONFIG_PATH env var first.
+
+        If SCALE_CONFIG_PATH is set and the file exists, loads from that path.
+        Otherwise falls back to testenv.yaml in the same directory as test_config.py.
 
         Returns:
             Dict mapping variable names to values, or empty dict if file doesn't exist.
@@ -30,7 +33,19 @@ class TestConfig:
         if cls._yaml_config is not None:
             return cls._yaml_config
 
-        config_path = Path(__file__).parent / "testenv.yaml"
+        config_path: Path | None = None
+        custom_path = os.getenv("SCALE_CONFIG_PATH")
+        if custom_path:
+            custom_config_path = Path(custom_path)
+            if custom_config_path.exists():
+                config_path = custom_config_path
+                logger.info(f"Using config from SCALE_CONFIG_PATH: {config_path}")
+            else:
+                logger.warning(f"SCALE_CONFIG_PATH set but file not found: {custom_path}")
+
+        if config_path is None:
+            config_path = Path(__file__).parent / "testenv.yaml"
+
         if not config_path.exists():
             cls._yaml_config = {}
             return cls._yaml_config

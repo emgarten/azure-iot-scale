@@ -16,9 +16,11 @@ import random
 import ssl
 import tempfile
 import time
+from enum import Enum
 
 import gevent
 from gevent.event import Event as GeventEvent
+from gevent import Greenlet
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
@@ -40,6 +42,18 @@ logger = logging.getLogger("locust.hub_cert_device")
 # MQTT configuration for credential management
 MQTT_PORT = 8883
 API_VERSION = "2025-08-01-preview"
+
+# Delay before disconnecting after receiving a certificate (200 response)
+DISCONNECT_DELAY_SECONDS = 5
+
+
+class CertState(Enum):
+    """State machine for certificate request lifecycle."""
+
+    IDLE = "idle"  # Not waiting for any cert response
+    REQUEST_SENT = "request_sent"  # Request sent, waiting for response (202 or just sent)
+    CERT_COMPLETE = "cert_complete"  # Successfully received certificate (200)
+    CERT_FAILED = "cert_failed"  # Error response received (4xx, 5xx, unexpected)
 
 
 class RegistrationState:
@@ -111,6 +125,12 @@ class HubCertDevice:
         # Uses gevent.Event instead of threading.Event to yield to other greenlets during wait()
         self._connect_event: GeventEvent = GeventEvent()
 
+        # Certificate request state machine
+        self._cert_state: CertState = CertState.IDLE
+
+        # Track pending delayed disconnect greenlet (for cancellation)
+        self._pending_disconnect: Optional[Greenlet] = None
+
     def _is_actually_connected(self) -> bool:
         """Check if MQTT client is actually connected.
 
@@ -126,6 +146,31 @@ class HubCertDevice:
         if self.client is None:
             return False
         return bool(self.client.is_connected())
+
+    @property
+    def cert_state(self) -> CertState:
+        """Get the current certificate request state.
+
+        Returns:
+            The current CertState (IDLE, REQUEST_SENT, CERT_COMPLETE, or CERT_FAILED).
+        """
+        return self._cert_state
+
+    def _cancel_pending_disconnect(self) -> None:
+        """Cancel any pending delayed disconnect."""
+        if self._pending_disconnect is not None:
+            self._pending_disconnect.kill(block=False)
+            self._pending_disconnect = None
+
+    def _schedule_disconnect(self) -> None:
+        """Schedule a disconnect after DISCONNECT_DELAY_SECONDS.
+
+        This is called after receiving a 200 response with certificate.
+        Uses gevent.spawn_later for non-blocking delayed execution.
+        """
+        self._cancel_pending_disconnect()
+        logger.debug(f"Scheduling disconnect in {DISCONNECT_DELAY_SECONDS}s for {self.device_name}")
+        self._pending_disconnect = gevent.spawn_later(DISCONNECT_DELAY_SECONDS, self.disconnect)
 
     def _cleanup_pending_requests(self, max_age_seconds: float = 600) -> None:
         """Clean up stale pending requests that have timed out.
@@ -668,6 +713,12 @@ class HubCertDevice:
 
         self.is_connected = False
 
+        # Reset certificate state to IDLE on disconnect
+        self._cert_state = CertState.IDLE
+
+        # Cancel any pending delayed disconnect
+        self._cancel_pending_disconnect()
+
         # Clean up temporary certificate and key files
         if self.cert_file and os.path.exists(self.cert_file):
             try:
@@ -793,6 +844,7 @@ class HubCertDevice:
         # Handle based on status code
         if status_code == "202":
             # Request accepted, waiting for certificate (don't remove from pending_requests)
+            # State remains REQUEST_SENT (still waiting)
             logger.debug(f"Credential request accepted for {self.device_name}")
             gevent.spawn(
                 self._fire_locust_event,
@@ -808,8 +860,9 @@ class HubCertDevice:
             if payload_data and "certificates" in payload_data:
                 cert_data = payload_data["certificates"]
                 if isinstance(cert_data, list) and len(cert_data) > 0:
-                    # Certificate chain received - record timestamp
+                    # Certificate chain received - record timestamp and update state
                     self.last_cert_chain_response_time = time.time()
+                    self._cert_state = CertState.CERT_COMPLETE
                     logger.info(f"Certificate chain received for {self.device_name}")
                     gevent.spawn(
                         self._fire_locust_event,
@@ -819,8 +872,11 @@ class HubCertDevice:
                         exception=None,
                         status_code=status_code,
                     )
+                    # Schedule disconnect after delay (only for successful 200)
+                    self._schedule_disconnect()
                 else:
-                    # Empty certificates array
+                    # Empty certificates array - treat as failure
+                    self._cert_state = CertState.CERT_FAILED
                     logger.warning(f"Empty certificates array for {self.device_name}")
                     gevent.spawn(
                         self._fire_locust_event,
@@ -831,7 +887,8 @@ class HubCertDevice:
                         status_code=status_code,
                     )
             else:
-                # No certificates field in response
+                # No certificates field in response - treat as failure
+                self._cert_state = CertState.CERT_FAILED
                 logger.warning(f"No certificates field in response for {self.device_name}")
                 gevent.spawn(
                     self._fire_locust_event,
@@ -847,7 +904,8 @@ class HubCertDevice:
                 del self.pending_requests[request_id]
 
         else:
-            # Unexpected status code
+            # Unexpected status code - treat as failure
+            self._cert_state = CertState.CERT_FAILED
             logger.warning(f"Credential request returned unexpected status {status_code} for {self.device_name}")
             gevent.spawn(
                 self._fire_locust_event,
@@ -1053,6 +1111,9 @@ class HubCertDevice:
             )
             return False
 
+        # Cancel any pending disconnect since we're sending a new request
+        self._cancel_pending_disconnect()
+
         # Check actual connection state and reconnect if needed
         # This handles both "never connected" and "connection was lost" cases
         if not self._is_actually_connected():
@@ -1101,6 +1162,9 @@ class HubCertDevice:
 
             # Store the request_id and send time for response time calculation
             self.pending_requests[request_id] = time.time()
+
+            # Update state to REQUEST_SENT after successful publish
+            self._cert_state = CertState.REQUEST_SENT
 
             # Log success (request sent, not waiting for response)
             total_time = int((time.time() - start_time) * 1000)

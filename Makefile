@@ -40,6 +40,11 @@ run-adr: ## Run locust load test with AdrDevicePatchUser
 	@echo "Running locust load test with AdrDevicePatchUser"
 	@PYTHONPATH=src/locust_pkg uv run --env-file .env locust -f src/locust_pkg --headless --autostart --run-time 300s --loglevel DEBUG AdrDevicePatchUser
 
+.PHONY: run-adr-user
+run-adr-user: ## Run locust load test with AdrUser (GET/PATCH)
+	@echo "Running locust load test with AdrUser"
+	@PYTHONPATH=src/locust_pkg uv run --env-file .env locust -f src/locust_pkg --headless --autostart --run-time 300s --loglevel DEBUG AdrUser
+
 .PHONY: run-hub-connect
 run-hub-connect: ## Run locust load test with CertHubConnectUser
 	@echo "Running locust load test with CertHubConnectUser"
