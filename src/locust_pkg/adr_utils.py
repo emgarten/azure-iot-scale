@@ -268,6 +268,46 @@ def patch_adr_device_os_version(
     return result, os_version
 
 
+def get_adr_device(
+    subscription_id: str,
+    resource_group: str,
+    namespace: str,
+    device_name: str,
+    token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Get a device from an ADR namespace via GET.
+
+    Args:
+        subscription_id: Azure subscription ID.
+        resource_group: Resource group name.
+        namespace: ADR namespace name.
+        device_name: Name of the device to retrieve.
+        token: Optional access token. If None, will be fetched automatically.
+
+    Returns:
+        dict: The device resource.
+
+    Raises:
+        requests.HTTPError: If the API call fails.
+    """
+    if token is None:
+        token = get_adr_token()
+
+    url = (
+        f"{ARM_BASE_URL}/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.DeviceRegistry/namespaces/{namespace}/devices/{device_name}"
+        f"?api-version={API_VERSION}"
+    )
+
+    headers = _get_headers(token)
+
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    _raise_for_status_with_body(response)
+
+    result: dict[str, Any] = response.json()
+    return result
+
+
 def delete_adr_device(
     subscription_id: str,
     resource_group: str,

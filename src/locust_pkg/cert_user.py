@@ -26,7 +26,7 @@ if wheel_path.exists():
     # The package top-level is typically a directory next to *.dist-info inside the wheel
     sys.path.insert(0, str(extract_dir))
 
-from hub_cert_device import HubCertDevice  # noqa: E402
+from hub_cert_device import CertState, HubCertDevice  # noqa: E402
 from storage import allocate_device_id_range, clear_device_counter, initialize_storage  # noqa: E402
 
 logger = logging.getLogger("locust.cert_user")
@@ -146,14 +146,18 @@ class CertUser(User):
         logger.info(f"CertUser initialized with {len(self.devices)} device(s)")
 
     def on_start(self) -> None:
-        """Eagerly provision and connect all devices before tasks run.
+        """Provision all devices and verify connectivity, then disconnect.
 
-        This prevents blocking during task execution, which would break
-        constant_pacing timing. Devices that fail to provision/connect
-        are logged but kept in the list for retry attempts during tasks.
+        This method provisions each device and verifies it can connect to IoT Hub,
+        then immediately disconnects to reduce load. Actual connections will be
+        made on-demand during certificate renewal tasks.
+
+        Devices that fail to provision/connect are logged but kept in the list
+        for retry attempts during tasks.
         """
-        logger.info(f"Starting eager initialization for {len(self.devices)} device(s)")
+        logger.info(f"Starting initialization for {len(self.devices)} device(s)")
 
+        provisioned_count = 0
         for i, device in enumerate(self.devices):
             logger.info(f"Initializing device {i + 1}/{len(self.devices)}: {device.device_name}")
 
@@ -167,9 +171,16 @@ class CertUser(User):
             if not device.is_connected:
                 if not device.connect():
                     logger.warning(f"Failed to connect device {device.device_name} during startup")
+                    continue
 
-        connected_count = sum(1 for d in self.devices if d.is_connected)
-        logger.info(f"Eager initialization complete: {connected_count}/{len(self.devices)} devices connected")
+            # Device is provisioned and connected - verification complete
+            provisioned_count += 1
+
+            # Disconnect immediately - we only needed to verify connectivity
+            device.disconnect()
+            logger.debug(f"Device {device.device_name} verified and disconnected")
+
+        logger.info(f"Initialization complete: {provisioned_count}/{len(self.devices)} devices verified")
 
     def _get_next_device(self) -> HubCertDevice | None:
         """Get the next device in round-robin fashion.
@@ -200,9 +211,11 @@ class CertUser(User):
     def request_certificate(self) -> None:
         """Request a certificate renewal from the next device in round-robin order.
 
-        Devices are eagerly initialized in on_start(), so this task should not
-        block on provisioning or connection. The request_new_certificate method
-        handles reconnection if the connection was lost.
+        Devices are initialized in on_start() and then disconnected.
+        This task handles connection lifecycle efficiently:
+        - If device is in REQUEST_SENT state (still waiting), disconnect and reconnect
+          to receive any pending certificate, then send a new request.
+        - Otherwise, the request_new_certificate method handles connection as needed.
         """
         device = self._get_next_device()
 
@@ -219,6 +232,13 @@ class CertUser(User):
         if not self._is_device_provisioned(device):
             logger.debug(f"Device {device.device_name} not provisioned, skipping")
             return
+
+        # Handle device still waiting for previous request
+        if device.cert_state == CertState.REQUEST_SENT:
+            logger.info(f"Device {device.device_name} still waiting, reconnecting to check for pending cert")
+            device.disconnect()
+            # request_new_certificate will reconnect and re-subscribe,
+            # which will receive any pending certificate if ready
 
         device.request_new_certificate(replace=config.get_bool("CERT_REPLACE_ENABLED"))
 

@@ -6,6 +6,7 @@
 #   cp deploy/loadtest-configs/cert-user.yaml.example deploy/loadtest-configs/cert-user.yaml
 #   cp deploy/loadtest-configs/adr-device-patch-user.yaml.example deploy/loadtest-configs/adr-device-patch-user.yaml
 #   cp deploy/loadtest-configs/cert-hub-connect-user.yaml.example deploy/loadtest-configs/cert-hub-connect-user.yaml
+#   cp deploy/loadtest-configs/adr-user.yaml.example deploy/loadtest-configs/adr-user.yaml
 #
 # Then edit the config files with your specific settings.
 #
@@ -36,7 +37,7 @@ if [ $# -lt 4 ] || [ $# -gt 5 ]; then
     echo "  group        - Resource group name"
     echo "  id           - Resource identifier (used for all resource names)"
     echo "  region       - Azure region (e.g., westus2)"
-    echo "  test-type    - Optional: cert|adr|hub-connect|all (default: all)"
+    echo "  test-type    - Optional: cert|adr|adr-get-patch|hub-connect|all (default: all)"
     echo ""
     echo "Examples:"
     echo "  $0 my-subscription my-rg loadtest-001 westus2"
@@ -61,11 +62,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Validate test type
 case "$TEST_TYPE" in
-    cert|adr|hub-connect|all)
+    cert|adr|adr-get-patch|hub-connect|all)
         ;;
     *)
         echo "Error: Invalid test-type '$TEST_TYPE'"
-        echo "Valid options: cert, adr, hub-connect, all"
+        echo "Valid options: cert, adr, adr-get-patch, hub-connect, all"
         exit 1
         ;;
 esac
@@ -188,12 +189,16 @@ case "$TEST_TYPE" in
     adr)
         check_config "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
         ;;
+    adr-get-patch)
+        check_config "$SCRIPT_DIR/loadtest-configs/adr-user.yaml"
+        ;;
     hub-connect)
         check_config "$SCRIPT_DIR/loadtest-configs/cert-hub-connect-user.yaml"
         ;;
     all)
         check_config "$SCRIPT_DIR/loadtest-configs/cert-user.yaml"
         check_config "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
+        check_config "$SCRIPT_DIR/loadtest-configs/adr-user.yaml"
         check_config "$SCRIPT_DIR/loadtest-configs/cert-hub-connect-user.yaml"
         ;;
 esac
@@ -206,12 +211,16 @@ case "$TEST_TYPE" in
     adr)
         deploy_test "adr-device-patch-user-test" "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
         ;;
+    adr-get-patch)
+        deploy_test "adr-user-test" "$SCRIPT_DIR/loadtest-configs/adr-user.yaml"
+        ;;
     hub-connect)
         deploy_test "cert-hub-connect-user-test" "$SCRIPT_DIR/loadtest-configs/cert-hub-connect-user.yaml"
         ;;
     all)
         deploy_test "cert-user-test" "$SCRIPT_DIR/loadtest-configs/cert-user.yaml"
         deploy_test "adr-device-patch-user-test" "$SCRIPT_DIR/loadtest-configs/adr-device-patch-user.yaml"
+        deploy_test "adr-user-test" "$SCRIPT_DIR/loadtest-configs/adr-user.yaml"
         deploy_test "cert-hub-connect-user-test" "$SCRIPT_DIR/loadtest-configs/cert-hub-connect-user.yaml"
         ;;
 esac
@@ -240,12 +249,16 @@ case "$TEST_TYPE" in
     adr)
         echo "  - adr-device-patch-user-test"
         ;;
+    adr-get-patch)
+        echo "  - adr-user-test"
+        ;;
     hub-connect)
         echo "  - cert-hub-connect-user-test"
         ;;
     all)
         echo "  - cert-user-test"
         echo "  - adr-device-patch-user-test"
+        echo "  - adr-user-test"
         echo "  - cert-hub-connect-user-test"
         ;;
 esac

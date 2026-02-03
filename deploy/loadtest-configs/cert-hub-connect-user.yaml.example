@@ -5,3 +5,39 @@ description: "Tests certificate-based IoT Hub connections"
 testPlan: ../../src/locust_pkg/cert_hub_connect.py
 testType: Locust
 engineInstances: 1
+autoStop: disable
+referenceIdentities:
+  - kind: Engine
+    type: SystemAssigned
+env:
+  # Azure DPS Configuration - Required
+  - name: PROVISIONING_HOST
+    value: "global.azure-devices-provisioning.net"
+  - name: PROVISIONING_IDSCOPE
+    value: "0ne00XXXXXX"
+  - name: PROVISIONING_SAS_KEY
+    value: "your-dps-symmetric-key"
+
+  # Device Configuration - Optional (defaults shown)
+  - name: DEVICE_NAME_PREFIX
+    value: "device"
+  - name: DEVICES_PER_USER
+    value: "1"
+  - name: CONNECT_REQUEST_INTERVAL
+    value: "90"
+  - name: DEVICE_ID_RANGE_SIZE
+    value: "2500"
+
+  # Azure Storage Configuration - Required for device data persistence
+  # Option 1: Connection string (takes precedence)
+  # - name: STORAGE_CONN_STR
+  #   value: "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=..."
+  # Option 2: Account URL with managed identity
+  - name: STORAGE_ACCOUNT_URL
+    value: "https://your-storage-account.blob.core.windows.net"
+  - name: STORAGE_CONTAINER_NAME
+    value: "scale"
+  - name: COUNTER_BLOB_PREFIX
+    value: "counter"
+  - name: DEVICE_DATA_BLOB_PREFIX
+    value: "data"

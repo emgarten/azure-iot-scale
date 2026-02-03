@@ -1,8 +1,8 @@
 version: v0.1
-testId: cert-user-test
-displayName: "CertUser - Certificate Renewal Load Test"
-description: "Tests certificate-based device provisioning and renewal against Azure IoT Hub and DPS"
-testPlan: ../../src/locust_pkg/cert_user.py
+testId: adr-user-test
+displayName: "AdrUser - ADR GET/PATCH Load Test"
+description: "Tests ADR device GET (70%) and PATCH (30%) operations with distributed device allocation"
+testPlan: ../../src/locust_pkg/adr_user.py
 testType: Locust
 engineInstances: 1
 autoStop: disable
@@ -10,27 +10,27 @@ referenceIdentities:
   - kind: Engine
     type: SystemAssigned
 env:
-  # Azure DPS Configuration - Required
-  - name: PROVISIONING_HOST
-    value: "global.azure-devices-provisioning.net"
-  - name: PROVISIONING_IDSCOPE
-    value: "0ne00XXXXXX"
-  - name: PROVISIONING_SAS_KEY
-    value: "your-dps-symmetric-key"
+  # Azure Device Registry (ADR) Configuration - Required
+  - name: ADR_SUBSCRIPTION_ID
+    value: "your-subscription-id"
+  - name: ADR_RESOURCE_GROUP
+    value: "your-resource-group"
+  - name: ADR_NAMESPACE
+    value: "your-adr-namespace"
+  - name: ADR_LOCATION
+    value: "eastus"
 
   # Device Configuration - Optional (defaults shown)
   - name: DEVICE_NAME_PREFIX
     value: "device"
   - name: DEVICES_PER_USER
     value: "1"
-  - name: CERT_REQUEST_INTERVAL
-    value: "90"
-  - name: CERT_REPLACE_ENABLED
-    value: "false"
+  - name: ADR_REQUEST_INTERVAL
+    value: "5"
   - name: DEVICE_ID_RANGE_SIZE
     value: "2500"
 
-  # Azure Storage Configuration - Required for device data persistence
+  # Azure Storage Configuration - Required for distributed device ID allocation
   # Option 1: Connection string (takes precedence)
   # - name: STORAGE_CONN_STR
   #   value: "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=..."
@@ -41,5 +41,3 @@ env:
     value: "scale"
   - name: COUNTER_BLOB_PREFIX
     value: "counter"
-  - name: DEVICE_DATA_BLOB_PREFIX
-    value: "data"
