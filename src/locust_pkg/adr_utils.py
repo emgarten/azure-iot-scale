@@ -253,6 +253,7 @@ def create_adr_device(
     )
 
     headers = _get_headers(token)
+    headers["If-None-Match"] = "*"  # Only create if device doesn't exist (returns 412 if exists)
     created_at = int(datetime.now(timezone.utc).timestamp())
     external_device_id = f"ext-{device_name}"
 

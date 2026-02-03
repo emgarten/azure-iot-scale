@@ -225,7 +225,7 @@ class AdrUser(User):
                 status = e.response.status_code if e.response else 0
                 elapsed = time.time() - start_time
 
-                if status == 409:  # Already exists - noop
+                if status in (409, 412):  # Already exists (409=Conflict, 412=Precondition Failed from If-None-Match)
                     logger.info(f"Device already exists: {device_name} ({elapsed:.1f}s)")
                     self._fire_request_event("create_device", start_time)
                     return True
