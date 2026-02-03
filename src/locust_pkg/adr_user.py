@@ -58,8 +58,7 @@ class AdrUser(User):
     def wait_time(self) -> float:
         """Calculate wait time between tasks using lazy config."""
         interval = config.get_int("ADR_REQUEST_INTERVAL")
-        devices = config.get_int("DEVICES_PER_USER")
-        result: float = constant_pacing(interval / devices)(self)  # type: ignore[no-untyped-call]
+        result: float = constant_pacing(interval)(self)  # type: ignore[no-untyped-call]
         return result
 
     @classmethod

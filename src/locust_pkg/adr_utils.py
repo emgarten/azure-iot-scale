@@ -14,6 +14,7 @@ from typing import Any, Optional
 import requests
 from azure.core.credentials import AccessToken
 from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger("locust.adr_utils")
 
@@ -30,6 +31,43 @@ _credential: Optional[ChainedTokenCredential] = None
 _credential_lock: threading.Lock = threading.Lock()
 _cached_token: Optional[AccessToken] = None
 _token_lock: threading.Lock = threading.Lock()
+
+# Global session singleton with connection pooling for efficient HTTP reuse
+_session: Optional[requests.Session] = None
+_session_lock: threading.Lock = threading.Lock()
+
+
+def _get_session() -> requests.Session:
+    """Get or create the global session singleton with connection pooling.
+
+    Thread-safe: Uses double-checked locking pattern for efficient singleton initialization.
+    The session is configured with a large connection pool to support high concurrency
+    in scale testing scenarios.
+
+    Returns:
+        requests.Session: The global session instance with connection pooling.
+    """
+    global _session
+
+    # Fast path: if already initialized, return immediately
+    if _session is not None:
+        return _session
+
+    # Slow path: acquire lock and check again (double-checked locking)
+    with _session_lock:
+        if _session is None:
+            _session = requests.Session()
+            # Configure connection pool for high concurrency
+            adapter = HTTPAdapter(
+                pool_connections=100,  # Number of connection pools (per host)
+                pool_maxsize=100,  # Max connections per pool
+                max_retries=0,  # We handle retries ourselves in adr_user.py
+            )
+            _session.mount("https://", adapter)
+            _session.mount("http://", adapter)
+            logger.info("Initialized HTTP session with connection pooling (pool_maxsize=100)")
+
+    return _session
 
 
 def _get_credential() -> ChainedTokenCredential:
@@ -133,7 +171,7 @@ def poll_async_operation(url: str, token: str) -> dict[str, Any]:
     headers = _get_headers(token)
 
     for attempt in range(MAX_POLL_ATTEMPTS):
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = _get_session().get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
         result: dict[str, Any] = response.json()
 
@@ -199,7 +237,7 @@ def create_adr_device(
         },
     }
 
-    response = requests.put(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+    response = _get_session().put(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
     _raise_for_status_with_body(response)
 
     # Handle long-running operation
@@ -254,7 +292,7 @@ def patch_adr_device_os_version(
         },
     }
 
-    response = requests.patch(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+    response = _get_session().patch(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
     _raise_for_status_with_body(response)
 
     # Handle long-running operation
@@ -301,7 +339,7 @@ def get_adr_device(
 
     headers = _get_headers(token)
 
-    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    response = _get_session().get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
     _raise_for_status_with_body(response)
 
     result: dict[str, Any] = response.json()
@@ -341,7 +379,7 @@ def delete_adr_device(
 
     headers = _get_headers(token)
 
-    response = requests.delete(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    response = _get_session().delete(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
     # 404 means device doesn't exist, which is fine for cleanup
     if response.status_code == 404:
