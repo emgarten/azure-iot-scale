@@ -7,6 +7,7 @@ round-robin fashion across all devices.
 """
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -222,7 +223,13 @@ class AdrUser(User):
                 return True
 
             except requests.HTTPError as e:
-                status = e.response.status_code if e.response else 0
+                # Extract status from response, or parse from error message as fallback
+                if e.response is not None:
+                    status = e.response.status_code
+                else:
+                    # Fallback: parse status from message like "504 Gateway Timeout for url: ..."
+                    match = re.match(r"(\d{3})\s", str(e))
+                    status = int(match.group(1)) if match else 0
                 elapsed = time.time() - start_time
 
                 if status in (409, 412):  # Already exists (409=Conflict, 412=Precondition Failed from If-None-Match)
@@ -236,17 +243,13 @@ class AdrUser(User):
                     )
                     self._fire_request_event("create_device", start_time, exception=e)
                     gevent.sleep(retry_after)
-                elif status >= 500:  # Server error
+                else:  # All other errors (5xx, 4xx, unknown) - retry indefinitely
                     logger.warning(
-                        f"Server error creating {device_name}: {status} (attempt {attempt}, {elapsed:.1f}s), retrying after {backoff}s"
+                        f"Error creating {device_name}: {status} (attempt {attempt}, {elapsed:.1f}s), retrying after {backoff}s"
                     )
                     self._fire_request_event("create_device", start_time, exception=e)
                     gevent.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
-                else:  # Non-retryable client error
-                    logger.error(f"Failed to create device {device_name}: {e} (attempt {attempt}, {elapsed:.1f}s)")
-                    self._fire_request_event("create_device", start_time, exception=e)
-                    raise
 
             except Exception as e:
                 elapsed = time.time() - start_time
