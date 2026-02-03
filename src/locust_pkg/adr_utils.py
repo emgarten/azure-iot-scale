@@ -9,8 +9,9 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+import gevent
 import requests
 from azure.core.credentials import AccessToken
 from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
@@ -154,12 +155,21 @@ def _raise_for_status_with_body(response: requests.Response) -> None:
         )
 
 
-def poll_async_operation(url: str, token: str) -> dict[str, Any]:
+def poll_async_operation(
+    url: str,
+    token: str,
+    operation_name: str = "async_operation",
+    on_poll: Optional[Callable[[int, str, float], None]] = None,
+) -> dict[str, Any]:
     """Poll an Azure async operation until completion.
 
     Args:
         url: The async operation URL to poll.
         token: The access token to use for authorization.
+        operation_name: Name for logging purposes (e.g., "create_device").
+        on_poll: Optional callback called after each poll attempt with
+                 (attempt_number, status, elapsed_seconds). Can be used
+                 to fire Locust events or custom logging.
 
     Returns:
         dict: The final operation result.
@@ -169,6 +179,9 @@ def poll_async_operation(url: str, token: str) -> dict[str, Any]:
         TimeoutError: If the operation does not complete within the timeout.
     """
     headers = _get_headers(token)
+    poll_start_time = time.time()
+
+    logger.info(f"Starting async polling for {operation_name} (max {MAX_POLL_ATTEMPTS} attempts)")
 
     for attempt in range(MAX_POLL_ATTEMPTS):
         response = _get_session().get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -176,14 +189,29 @@ def poll_async_operation(url: str, token: str) -> dict[str, Any]:
         result: dict[str, Any] = response.json()
 
         status = result.get("status", "").lower()
+        elapsed = time.time() - poll_start_time
+
+        if on_poll is not None:
+            on_poll(attempt + 1, status, elapsed)
+
         if status == "succeeded":
+            logger.info(f"Async {operation_name} succeeded after {attempt + 1} poll(s), {elapsed:.1f}s total")
             return result
         elif status in ("failed", "canceled"):
             error = result.get("error", {})
+            logger.error(f"Async {operation_name} {status} after {attempt + 1} poll(s): {error.get('message')}")
             raise RuntimeError(f"Async operation {status}: {error.get('message', 'Unknown error')}")
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        # Log progress every 5 attempts or on first attempt
+        if attempt == 0 or (attempt + 1) % 5 == 0:
+            logger.info(
+                f"Polling {operation_name}: attempt {attempt + 1}/{MAX_POLL_ATTEMPTS}, status={status}, elapsed={elapsed:.1f}s"
+            )
 
+        gevent.sleep(POLL_INTERVAL_SECONDS)
+
+    elapsed = time.time() - poll_start_time
+    logger.error(f"Async {operation_name} timed out after {MAX_POLL_ATTEMPTS} polls, {elapsed:.1f}s")
     raise TimeoutError(f"Async operation did not complete after {MAX_POLL_ATTEMPTS * POLL_INTERVAL_SECONDS} seconds")
 
 
@@ -194,6 +222,7 @@ def create_adr_device(
     device_name: str,
     location: str,
     token: Optional[str] = None,
+    on_poll: Optional[Callable[[int, str, float], None]] = None,
 ) -> dict[str, Any]:
     """Create a device in an ADR namespace via PUT.
 
@@ -204,6 +233,7 @@ def create_adr_device(
         device_name: Name for the new device.
         location: Azure location for the device.
         token: Optional access token. If None, will be fetched automatically.
+        on_poll: Optional callback for async polling progress. See poll_async_operation.
 
     Returns:
         dict: The created device resource.
@@ -211,6 +241,8 @@ def create_adr_device(
     Raises:
         requests.HTTPError: If the API call fails.
     """
+    create_start_time = time.time()
+
     if token is None:
         token = get_adr_token()
 
@@ -237,15 +269,24 @@ def create_adr_device(
         },
     }
 
+    logger.info(f"Sending PUT request for device: {device_name}")
     response = _get_session().put(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+    put_elapsed = time.time() - create_start_time
+    logger.info(f"PUT response for {device_name}: status={response.status_code}, elapsed={put_elapsed:.1f}s")
+
     _raise_for_status_with_body(response)
 
     # Handle long-running operation
     if response.status_code in (201, 202):
         async_url = response.headers.get("Azure-AsyncOperation") or response.headers.get("Location")
         if async_url:
-            logger.debug(f"Waiting for device creation to complete: {device_name}")
-            poll_async_operation(async_url, token)
+            logger.info(f"Device {device_name} requires async polling (status={response.status_code})")
+            poll_async_operation(async_url, token, operation_name=f"create_{device_name}", on_poll=on_poll)
+    else:
+        logger.info(f"Device {device_name} created synchronously (status={response.status_code})")
+
+    total_elapsed = time.time() - create_start_time
+    logger.info(f"Device {device_name} creation complete, total time: {total_elapsed:.1f}s")
 
     result: dict[str, Any] = response.json()
     return result
