@@ -221,33 +221,56 @@ class AdrUser(User):
         get_adr_token()
 
         # Check if device already exists via GET (higher throttle limit than PUT)
-        check_start_time = time.time()
-        try:
-            get_adr_device(
-                subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
-                resource_group=config.get("ADR_RESOURCE_GROUP"),
-                namespace=config.get("ADR_NAMESPACE"),
-                device_name=device_name,
-            )
-            # Device exists, no need to create
-            elapsed = time.time() - check_start_time
-            self._fire_request_event("check_device_exists", check_start_time)
-            logger.info(f"Device already exists (GET check): {device_name} ({elapsed:.1f}s)")
-            return True
-        except requests.HTTPError as e:
-            # 404 is expected when device doesn't exist - don't log as error
-            elapsed = time.time() - check_start_time
-            if e.response is not None and e.response.status_code == 404:
+        # Retry indefinitely on 429, fall through to PUT on other errors
+        get_backoff = 1.0
+        while True:
+            check_start_time = time.time()
+            try:
+                get_adr_device(
+                    subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
+                    resource_group=config.get("ADR_RESOURCE_GROUP"),
+                    namespace=config.get("ADR_NAMESPACE"),
+                    device_name=device_name,
+                )
+                # Device exists, no need to create
+                elapsed = time.time() - check_start_time
                 self._fire_request_event("check_device_exists", check_start_time)
-                logger.info(f"Device does not exist (404): {device_name} ({elapsed:.1f}s), proceeding with PUT")
-            else:
+                logger.info(f"Device already exists (GET check): {device_name} ({elapsed:.1f}s)")
+                return True
+            except requests.HTTPError as e:
+                elapsed = time.time() - check_start_time
+                status = e.response.status_code if e.response is not None else 0
+                corr_id = _get_correlation_id(e)
+                corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+
+                if status == 404:
+                    # Device doesn't exist - expected, proceed to PUT (no exception = success event)
+                    self._fire_request_event("check_device_exists", check_start_time)
+                    logger.info(f"Device does not exist (404): {device_name} ({elapsed:.1f}s), proceeding with PUT")
+                    break  # Exit GET loop, continue to PUT
+                elif status == 429:
+                    # Throttled - retry indefinitely
+                    retry_after = (
+                        float(e.response.headers.get("Retry-After", get_backoff)) if e.response else get_backoff
+                    )
+                    self._fire_request_event("check_device_exists", check_start_time, exception=e)
+                    logger.warning(
+                        f"Throttled checking {device_name} ({elapsed:.1f}s){corr_id_msg}, retrying after {retry_after}s"
+                    )
+                    gevent.sleep(retry_after)
+                else:
+                    # Other errors - log and fall through to PUT
+                    self._fire_request_event("check_device_exists", check_start_time, exception=e)
+                    logger.info(
+                        f"GET check failed for {device_name}: {status} ({elapsed:.1f}s){corr_id_msg}, proceeding with PUT"
+                    )
+                    break  # Exit GET loop, continue to PUT
+            except Exception as e:
+                # Non-HTTP errors - log and proceed with PUT
+                elapsed = time.time() - check_start_time
                 self._fire_request_event("check_device_exists", check_start_time, exception=e)
                 logger.info(f"GET check failed for {device_name} ({elapsed:.1f}s), proceeding with PUT: {e}")
-        except Exception as e:
-            # Non-HTTP errors - log and proceed with PUT
-            elapsed = time.time() - check_start_time
-            self._fire_request_event("check_device_exists", check_start_time, exception=e)
-            logger.info(f"GET check failed for {device_name} ({elapsed:.1f}s), proceeding with PUT: {e}")
+                break  # Exit GET loop, continue to PUT
 
         while True:
             attempt += 1
