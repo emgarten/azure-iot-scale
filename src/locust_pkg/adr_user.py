@@ -22,6 +22,23 @@ from utils import config
 
 logger = logging.getLogger("locust.adr_user")
 
+# ARM correlation ID header for tracking requests
+CORRELATION_ID_HEADER = "x-ms-correlation-request-id"
+
+
+def _get_correlation_id(exception: BaseException) -> str | None:
+    """Extract ARM correlation ID from an HTTPError response if available.
+
+    Args:
+        exception: The exception to extract correlation ID from.
+
+    Returns:
+        The correlation ID string if present, None otherwise.
+    """
+    if isinstance(exception, requests.HTTPError) and exception.response is not None:
+        return exception.response.headers.get(CORRELATION_ID_HEADER)
+    return None
+
 
 @events.test_stop.add_listener  # type: ignore[misc]
 def on_test_stop(environment: Any, **kwargs: Any) -> None:
@@ -203,6 +220,26 @@ class AdrUser(User):
         logger.info(f"Pre-fetching auth token for device creation: {device_name}")
         get_adr_token()
 
+        # Check if device already exists via GET (higher throttle limit than PUT)
+        check_start_time = time.time()
+        try:
+            get_adr_device(
+                subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
+                resource_group=config.get("ADR_RESOURCE_GROUP"),
+                namespace=config.get("ADR_NAMESPACE"),
+                device_name=device_name,
+            )
+            # Device exists, no need to create
+            elapsed = time.time() - check_start_time
+            self._fire_request_event("check_device_exists", check_start_time)
+            logger.info(f"Device already exists (GET check): {device_name} ({elapsed:.1f}s)")
+            return True
+        except Exception as e:
+            # Any error (404, 429, 500, etc.) - fall back to PUT path
+            elapsed = time.time() - check_start_time
+            self._fire_request_event("check_device_exists", check_start_time, exception=e)
+            logger.info(f"GET check failed for {device_name} ({elapsed:.1f}s), proceeding with PUT: {e}")
+
         while True:
             attempt += 1
             start_time = time.time()
@@ -238,14 +275,18 @@ class AdrUser(User):
                     return True
                 elif status == 429:  # Throttled
                     retry_after = float(e.response.headers.get("Retry-After", backoff)) if e.response else backoff
+                    corr_id = _get_correlation_id(e)
+                    corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
                     logger.warning(
-                        f"Throttled creating {device_name} (attempt {attempt}, {elapsed:.1f}s), retrying after {retry_after}s"
+                        f"Throttled creating {device_name} (attempt {attempt}, {elapsed:.1f}s){corr_id_msg}, retrying after {retry_after}s"
                     )
                     self._fire_request_event("create_device", start_time, exception=e)
                     gevent.sleep(retry_after)
                 else:  # All other errors (5xx, 4xx, unknown) - retry indefinitely
+                    corr_id = _get_correlation_id(e)
+                    corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
                     logger.warning(
-                        f"Error creating {device_name}: {status} (attempt {attempt}, {elapsed:.1f}s), retrying after {backoff}s"
+                        f"Error creating {device_name}: {status} (attempt {attempt}, {elapsed:.1f}s){corr_id_msg}, retrying after {backoff}s"
                     )
                     self._fire_request_event("create_device", start_time, exception=e)
                     gevent.sleep(backoff)
@@ -317,7 +358,9 @@ class AdrUser(User):
             logger.debug(f"Got device {device_name}")
 
         except Exception as e:
-            logger.error(f"Failed to get device {device_name}: {e}")
+            corr_id = _get_correlation_id(e)
+            corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+            logger.error(f"Failed to get device {device_name}: {e}{corr_id_msg}")
             self._fire_request_event("get_device", start_time, exception=e)
 
     @task(weight=30)
@@ -346,5 +389,7 @@ class AdrUser(User):
             logger.debug(f"Patched device {device_name} with OS version: {os_version}")
 
         except Exception as e:
-            logger.error(f"Failed to patch device {device_name}: {e}")
+            corr_id = _get_correlation_id(e)
+            corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+            logger.error(f"Failed to patch device {device_name}: {e}{corr_id_msg}")
             self._fire_request_event("patch_device", start_time, exception=e)
