@@ -234,8 +234,17 @@ class AdrUser(User):
             self._fire_request_event("check_device_exists", check_start_time)
             logger.info(f"Device already exists (GET check): {device_name} ({elapsed:.1f}s)")
             return True
+        except requests.HTTPError as e:
+            # 404 is expected when device doesn't exist - don't log as error
+            elapsed = time.time() - check_start_time
+            if e.response is not None and e.response.status_code == 404:
+                self._fire_request_event("check_device_exists", check_start_time)
+                logger.info(f"Device does not exist (404): {device_name} ({elapsed:.1f}s), proceeding with PUT")
+            else:
+                self._fire_request_event("check_device_exists", check_start_time, exception=e)
+                logger.info(f"GET check failed for {device_name} ({elapsed:.1f}s), proceeding with PUT: {e}")
         except Exception as e:
-            # Any error (404, 429, 500, etc.) - fall back to PUT path
+            # Non-HTTP errors - log and proceed with PUT
             elapsed = time.time() - check_start_time
             self._fire_request_event("check_device_exists", check_start_time, exception=e)
             logger.info(f"GET check failed for {device_name} ({elapsed:.1f}s), proceeding with PUT: {e}")
