@@ -7,10 +7,12 @@ round-robin fashion across all devices.
 """
 
 import logging
+import re
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
+import gevent
 import requests
 from locust import User, constant_pacing, events, task
 
@@ -19,6 +21,23 @@ from storage import allocate_device_id_range, clear_device_counter, initialize_s
 from utils import config
 
 logger = logging.getLogger("locust.adr_user")
+
+# ARM correlation ID header for tracking requests
+CORRELATION_ID_HEADER = "x-ms-correlation-request-id"
+
+
+def _get_correlation_id(exception: BaseException) -> str | None:
+    """Extract ARM correlation ID from an HTTPError response if available.
+
+    Args:
+        exception: The exception to extract correlation ID from.
+
+    Returns:
+        The correlation ID string if present, None otherwise.
+    """
+    if isinstance(exception, requests.HTTPError) and exception.response is not None:
+        return exception.response.headers.get(CORRELATION_ID_HEADER)
+    return None
 
 
 @events.test_stop.add_listener  # type: ignore[misc]
@@ -159,6 +178,31 @@ class AdrUser(User):
             context={},
         )
 
+    def _make_poll_callback(self, device_name: str, poll_start_time: float) -> Callable[[int, str, float], None]:
+        """Create a callback for firing Locust events during async polling.
+
+        Args:
+            device_name: Name of the device being created.
+            poll_start_time: Start time of the polling operation.
+
+        Returns:
+            A callback function for poll_async_operation.
+        """
+
+        def on_poll(attempt: int, status: str, elapsed: float) -> None:
+            # Fire a Locust event for each poll attempt
+            response_time = (time.time() - poll_start_time) * 1000
+            self.environment.events.request.fire(
+                request_type="ADR",
+                name=f"poll_create_{device_name}",
+                response_time=response_time,
+                response_length=0,
+                exception=None,
+                context={"attempt": attempt, "status": status},
+            )
+
+        return on_poll
+
     def _create_device_with_retry(self, device_name: str) -> bool:
         """Create device with indefinite retry on transient errors.
 
@@ -170,12 +214,69 @@ class AdrUser(User):
         """
         backoff = 1.0
         max_backoff = 60.0
+        attempt = 0
 
         # Pre-fetch token once to ensure auth is working
+        logger.info(f"Pre-fetching auth token for device creation: {device_name}")
         get_adr_token()
 
+        # Check if device already exists via GET (higher throttle limit than PUT)
+        # Retry indefinitely on 429, fall through to PUT on other errors
+        get_backoff = 1.0
         while True:
+            check_start_time = time.time()
+            try:
+                get_adr_device(
+                    subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
+                    resource_group=config.get("ADR_RESOURCE_GROUP"),
+                    namespace=config.get("ADR_NAMESPACE"),
+                    device_name=device_name,
+                )
+                # Device exists, no need to create
+                elapsed = time.time() - check_start_time
+                self._fire_request_event("check_device_exists", check_start_time)
+                logger.info(f"Device already exists (GET check): {device_name} ({elapsed:.1f}s)")
+                return True
+            except requests.HTTPError as e:
+                elapsed = time.time() - check_start_time
+                status = e.response.status_code if e.response is not None else 0
+                corr_id = _get_correlation_id(e)
+                corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+
+                if status == 404:
+                    # Device doesn't exist - expected, proceed to PUT (no exception = success event)
+                    self._fire_request_event("check_device_exists", check_start_time)
+                    logger.info(f"Device does not exist (404): {device_name} ({elapsed:.1f}s), proceeding with PUT")
+                    break  # Exit GET loop, continue to PUT
+                elif status == 429:
+                    # Throttled - retry indefinitely
+                    retry_after = (
+                        float(e.response.headers.get("Retry-After", get_backoff)) if e.response else get_backoff
+                    )
+                    self._fire_request_event("check_device_exists", check_start_time, exception=e)
+                    logger.warning(
+                        f"Throttled checking {device_name} ({elapsed:.1f}s){corr_id_msg}, retrying after {retry_after}s"
+                    )
+                    gevent.sleep(retry_after)
+                else:
+                    # Other errors - log and fall through to PUT
+                    self._fire_request_event("check_device_exists", check_start_time, exception=e)
+                    logger.info(
+                        f"GET check failed for {device_name}: {status} ({elapsed:.1f}s){corr_id_msg}, proceeding with PUT"
+                    )
+                    break  # Exit GET loop, continue to PUT
+            except Exception as e:
+                # Non-HTTP errors - log and proceed with PUT
+                elapsed = time.time() - check_start_time
+                self._fire_request_event("check_device_exists", check_start_time, exception=e)
+                logger.info(f"GET check failed for {device_name} ({elapsed:.1f}s), proceeding with PUT: {e}")
+                break  # Exit GET loop, continue to PUT
+
+        while True:
+            attempt += 1
             start_time = time.time()
+            logger.info(f"Creating device {device_name} (attempt {attempt})")
+
             try:
                 create_adr_device(
                     subscription_id=config.get("ADR_SUBSCRIPTION_ID"),
@@ -183,48 +284,72 @@ class AdrUser(User):
                     namespace=config.get("ADR_NAMESPACE"),
                     device_name=device_name,
                     location=config.get("ADR_LOCATION"),
+                    on_poll=self._make_poll_callback(device_name, start_time),
                 )
+                elapsed = time.time() - start_time
                 self._fire_request_event("create_device", start_time)
-                logger.info(f"Device created: {device_name}")
+                logger.info(f"Device created: {device_name} (attempt {attempt}, {elapsed:.1f}s)")
                 return True
 
             except requests.HTTPError as e:
-                status = e.response.status_code if e.response else 0
+                # Extract status from response, or parse from error message as fallback
+                if e.response is not None:
+                    status = e.response.status_code
+                else:
+                    # Fallback: parse status from message like "504 Gateway Timeout for url: ..."
+                    match = re.match(r"(\d{3})\s", str(e))
+                    status = int(match.group(1)) if match else 0
+                elapsed = time.time() - start_time
 
-                if status == 409:  # Already exists - noop
-                    logger.info(f"Device already exists: {device_name}")
+                if status in (409, 412):  # Already exists (409=Conflict, 412=Precondition Failed from If-None-Match)
+                    logger.info(f"Device already exists: {device_name} ({elapsed:.1f}s)")
                     self._fire_request_event("create_device", start_time)
                     return True
                 elif status == 429:  # Throttled
                     retry_after = float(e.response.headers.get("Retry-After", backoff)) if e.response else backoff
-                    logger.warning(f"Throttled creating {device_name}, retrying after {retry_after}s")
+                    corr_id = _get_correlation_id(e)
+                    corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+                    logger.warning(
+                        f"Throttled creating {device_name} (attempt {attempt}, {elapsed:.1f}s){corr_id_msg}, retrying after {retry_after}s"
+                    )
                     self._fire_request_event("create_device", start_time, exception=e)
-                    time.sleep(retry_after)
-                elif status >= 500:  # Server error
-                    logger.warning(f"Server error creating {device_name}: {status}, retrying after {backoff}s")
+                    gevent.sleep(retry_after)
+                else:  # All other errors (5xx, 4xx, unknown) - retry indefinitely
+                    corr_id = _get_correlation_id(e)
+                    corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+                    logger.warning(
+                        f"Error creating {device_name}: {status} (attempt {attempt}, {elapsed:.1f}s){corr_id_msg}, retrying after {backoff}s"
+                    )
                     self._fire_request_event("create_device", start_time, exception=e)
-                    time.sleep(backoff)
+                    gevent.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
-                else:  # Non-retryable client error
-                    logger.error(f"Failed to create device {device_name}: {e}")
-                    self._fire_request_event("create_device", start_time, exception=e)
-                    raise
 
             except Exception as e:
-                logger.error(f"Unexpected error creating device {device_name}: {e}")
+                elapsed = time.time() - start_time
+                logger.error(f"Unexpected error creating device {device_name}: {e} (attempt {attempt}, {elapsed:.1f}s)")
                 self._fire_request_event("create_device", start_time, exception=e)
-                time.sleep(backoff)
+                gevent.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
     def on_start(self) -> None:
         """Create all devices on startup with robust retry handling."""
-        logger.info(f"Creating {len(self.device_names)} device(s)")
+        total_devices = len(self.device_names)
+        on_start_time = time.time()
+        logger.info(f"on_start: Creating {total_devices} device(s)")
 
         for i, device_name in enumerate(self.device_names):
-            logger.info(f"Creating device {i + 1}/{len(self.device_names)}: {device_name}")
+            device_start = time.time()
+            logger.info(f"on_start: Creating device {i + 1}/{total_devices}: {device_name}")
             self._create_device_with_retry(device_name)
+            device_elapsed = time.time() - device_start
+            total_elapsed = time.time() - on_start_time
+            logger.info(
+                f"on_start: Progress {i + 1}/{total_devices} ({100 * (i + 1) // total_devices}%), "
+                f"device took {device_elapsed:.1f}s, total elapsed {total_elapsed:.1f}s"
+            )
 
-        logger.info(f"All {len(self.device_names)} device(s) created")
+        total_elapsed = time.time() - on_start_time
+        logger.info(f"on_start: All {total_devices} device(s) created in {total_elapsed:.1f}s")
 
     def _get_next_device_name(self) -> str | None:
         """Get the next device name in round-robin fashion.
@@ -265,7 +390,9 @@ class AdrUser(User):
             logger.debug(f"Got device {device_name}")
 
         except Exception as e:
-            logger.error(f"Failed to get device {device_name}: {e}")
+            corr_id = _get_correlation_id(e)
+            corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+            logger.error(f"Failed to get device {device_name}: {e}{corr_id_msg}")
             self._fire_request_event("get_device", start_time, exception=e)
 
     @task(weight=30)
@@ -294,5 +421,7 @@ class AdrUser(User):
             logger.debug(f"Patched device {device_name} with OS version: {os_version}")
 
         except Exception as e:
-            logger.error(f"Failed to patch device {device_name}: {e}")
+            corr_id = _get_correlation_id(e)
+            corr_id_msg = f", correlation_id={corr_id}" if corr_id else ""
+            logger.error(f"Failed to patch device {device_name}: {e}{corr_id_msg}")
             self._fire_request_event("patch_device", start_time, exception=e)
