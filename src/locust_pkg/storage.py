@@ -32,7 +32,7 @@ device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 
 # Counter sharding: number of counter partitions to reduce contention
 # With N shards, max N workers can allocate simultaneously without conflict
-counter_shard_count = int(os.getenv("COUNTER_SHARD_COUNT", "16"))
+counter_shard_count = int(os.getenv("COUNTER_SHARD_COUNT", "25"))
 
 # File descriptor warning threshold for scale testing
 min_file_descriptors = int(os.getenv("MIN_FILE_DESCRIPTORS", "65536"))

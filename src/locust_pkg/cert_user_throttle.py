@@ -273,7 +273,7 @@ class CertUserThrottle(User):
             logger.debug(f"Device {device.device_name} not provisioned, skipping")
             return
 
-        device.request_new_certificate(use_invalid_replace=True)
+        device.request_new_certificate(use_invalid_replace=False)
 
     def on_stop(self) -> None:
         """Cleanup method called when the user stops."""
