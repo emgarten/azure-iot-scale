@@ -1,0 +1,37 @@
+{
+  "_comment": "Bug Bash Test Configuration",
+
+  "connection": {
+    "_comment": "Azure DPS credentials - get these from Azure Portal",
+    "id_scope": "YOUR_ID_SCOPE_HERE",
+    "sas_key": "YOUR_SAS_KEY_HERE",
+    "provisioning_host": "global.azure-devices-provisioning.net"
+  },
+
+  "device": {
+    "_comment": "Use a unique device name like 'bugbash-yourname'",
+    "device_name": "test-device",
+    "output_dir": "./certs"
+  },
+
+  "test": {
+    "_comment": "Scenario options: success, provision-only, renew-only, telemetry-only",
+    "scenario": "success",
+    "verbose": false
+  },
+
+  "renewal": {
+    "_comment": "Custom renewal payload. Use {id} for device ID and {csr} for the CSR.",
+    "_comment2": "Remove 'payload' or set to null to use default: {\"id\": device_id, \"csr\": csr_data}",
+    "payload": {
+      "id": "{id}",
+      "csr": "{csr}",
+      "replace": "*"
+    }
+  },
+
+  "telemetry": {
+    "_comment": "Number of test messages to send",
+    "message_count": 3
+  }
+}

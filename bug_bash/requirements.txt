@@ -1,0 +1,5 @@
+# Bug Bash Test Script Dependencies
+paho-mqtt>=1.6.0,<2.0.0
+cryptography>=41.0.0
+orjson>=3.9.0
+azure-iot-device>=2.12.0
