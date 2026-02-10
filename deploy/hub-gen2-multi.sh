@@ -17,7 +17,7 @@ set -e
 # fi
 
 # Assign command-line parameters
-SUBSCRIPTION="d4ccd08b-0809-446d-a8b7-7af8a90109cd"
+SUBSCRIPTION="-"
 RESOURCE_GROUP="ruath-gen2"
 ID="ruath-can"
 REGION="centraluseuap"
