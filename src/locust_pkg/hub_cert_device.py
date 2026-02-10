@@ -46,6 +46,10 @@ MQTT_PORT = 8883
 API_VERSION = "2025-08-01-preview"
 credential_response_timeout = int(os.getenv("CREDENTIAL_RESPONSE_TIMEOUT", "300"))  # Default 5 minutes
 
+# MQTT keepalive in seconds - Azure IoT Hub recommends 230s for reliable connections
+# Lower values (like 60s) can cause frequent rc=7 (MQTT_ERR_CONN_LOST) under load
+MQTT_KEEPALIVE = int(os.getenv("MQTT_KEEPALIVE", "230"))
+
 
 class RegistrationState:
     """Represents the registration state from DPS."""
@@ -118,6 +122,9 @@ class HubCertDevice:
 
         # Track successful certificate requests (Azure IoT Hub limits to 20 per device)
         self.successful_cert_requests: int = 0
+
+        # Guard to prevent concurrent reconnection attempts
+        self._reconnecting: bool = False
 
     @property
     def private_key(self) -> EllipticCurvePrivateKey:
@@ -235,6 +242,9 @@ class HubCertDevice:
         This callback is invoked when the MQTT client disconnects, either
         expectedly (rc=0) or unexpectedly (rc!=0).
 
+        For unexpected disconnects (rc != 0), this method spawns an automatic
+        reconnection attempt using gevent to marshal back to the greenlet context.
+
         Args:
             client: The MQTT client instance
             userdata: User data (unused)
@@ -245,8 +255,9 @@ class HubCertDevice:
         self._last_disconnect_rc = rc
 
         if rc != 0:
-            # Unexpected disconnection
-            logger.warning(f"Unexpected MQTT disconnect for {self.device_name}, rc={rc}")
+            # Unexpected disconnection - log at debug level to reduce noise
+            # (reconnection will be attempted automatically)
+            logger.debug(f"Unexpected MQTT disconnect for {self.device_name}, rc={rc}")
             if was_connected:
                 self.environment.events.request.fire(
                     request_type="Hub",
@@ -256,6 +267,9 @@ class HubCertDevice:
                     exception=f"Unexpected disconnect with rc={rc}",
                     context={"device_name": self.device_name, "rc": rc},
                 )
+                # Spawn automatic reconnection attempt using gevent
+                # This marshals to the greenlet context and avoids blocking the Paho thread
+                gevent.spawn(self._auto_reconnect)
         else:
             logger.debug(f"MQTT disconnected for {self.device_name} (expected)")
 
@@ -263,6 +277,63 @@ class HubCertDevice:
         if self.pending_requests:
             logger.debug(f"Clearing {len(self.pending_requests)} pending requests on disconnect for {self.device_name}")
             self.pending_requests.clear()
+
+    def _auto_reconnect(self) -> None:
+        """Attempt automatic reconnection after an unexpected disconnect.
+
+        This method is called via gevent.spawn() from _on_disconnect to handle
+        automatic reconnection in the greenlet context. It uses exponential
+        backoff with jitter to avoid thundering herd problems when many devices
+        disconnect simultaneously.
+
+        The reconnection is fire-and-forget - if it fails, the next call to
+        request_new_certificate() will also attempt to reconnect.
+        """
+        # Guard against concurrent reconnection attempts
+        if self._reconnecting:
+            logger.debug(f"Reconnection already in progress for {self.device_name}, skipping")
+            return
+        self._reconnecting = True
+
+        try:
+            # Add random initial delay to spread out reconnection attempts
+            # This prevents thundering herd when many devices disconnect at once
+            initial_delay = random.uniform(1.0, 10.0)
+            gevent.sleep(initial_delay)
+
+            # Clean up the old client before reconnecting
+            # Store in local variable to prevent race conditions
+            old_client = self.client
+            if old_client is not None:
+                try:
+                    old_client.loop_stop()
+                except Exception:
+                    pass
+                self.client = None
+
+            # Attempt reconnection with limited retries
+            max_attempts = 3
+            base_wait = 5.0
+
+            for attempt in range(1, max_attempts + 1):
+                if self.is_connected:
+                    # Already reconnected (possibly by another path)
+                    return
+
+                logger.debug(f"Auto-reconnect attempt {attempt}/{max_attempts} for {self.device_name}")
+
+                if self.connect():
+                    logger.info(f"Auto-reconnect successful for {self.device_name}")
+                    return
+
+                if attempt < max_attempts:
+                    # Exponential backoff with jitter
+                    wait_time = base_wait * (2 ** (attempt - 1)) + random.uniform(0, 5.0)
+                    gevent.sleep(wait_time)
+
+            logger.debug(f"Auto-reconnect failed after {max_attempts} attempts for {self.device_name}")
+        finally:
+            self._reconnecting = False
 
     def save_device_data(self, data_dict: dict[str, Any]) -> None:
         """Save device data to Azure Blob Storage with Locust event tracking.
@@ -392,6 +463,10 @@ class HubCertDevice:
     def _restore_from_storage(self, device_data: dict[str, Any]) -> bool:
         """Restore device state from storage data.
 
+        This method loads the private key FIRST to ensure consistency. If any
+        part of the restoration fails, all state is cleaned up to prevent
+        key/certificate mismatches.
+
         Args:
             device_data: Dictionary containing stored device data
 
@@ -399,30 +474,42 @@ class HubCertDevice:
             True if restoration was successful, False otherwise
         """
         try:
-            reg_state = RegistrationState(
-                assigned_hub=device_data["assigned_hub"],
-                device_id=device_data["device_id"],
-            )
-            self.registration_result = RegistrationResult(
-                status=device_data["registration_status"],
-                registration_state=reg_state,
-            )
-
-            # Deserialize private key from PEM
+            # Load private key FIRST - this is the most critical piece
+            # If this fails, we don't want to set any other state
             loaded_key = serialization.load_pem_private_key(
                 device_data["private_key_pem"].encode("utf-8"), password=None
             )
             # Type assertion - we know this is an EC key
-            self.private_key = cast(EllipticCurvePrivateKey, loaded_key)
+            restored_private_key = cast(EllipticCurvePrivateKey, loaded_key)
 
             # Load certificate
-            self.issued_cert_data = device_data["issued_cert_pem"]
+            restored_cert_data = device_data["issued_cert_pem"]
+
+            # Build registration state
+            reg_state = RegistrationState(
+                assigned_hub=device_data["assigned_hub"],
+                device_id=device_data["device_id"],
+            )
+            restored_registration = RegistrationResult(
+                status=device_data["registration_status"],
+                registration_state=reg_state,
+            )
+
+            # Only set instance state after ALL parsing succeeded
+            # This prevents partial state on failure
+            self._private_key = restored_private_key
+            self.issued_cert_data = restored_cert_data
+            self.registration_result = restored_registration
 
             logger.info(f"Restored device state from storage for {self.device_name}")
             return True
 
         except Exception as e:
             logger.warning(f"Failed to restore device state from storage: {e}")
+            # Clean up any partial state to ensure consistency
+            self._private_key = None
+            self.issued_cert_data = ""
+            self.registration_result = None
             return False
 
     def _provision_inner(self) -> None:
@@ -664,10 +751,19 @@ class HubCertDevice:
                             "deleting bad data and re-provisioning"
                         )
                         self.delete_device_data()
-                        # Clear the restored state so we can re-provision
-                        # Note: Keep private_key intact to maintain CSR consistency
+                        # Clear registration and cert but KEEP the private key
+                        # This ensures the CSR sent to DPS uses the same key, which
+                        # prevents key/cert mismatch if DPS returns cached data
                         self.registration_result = None
                         self.issued_cert_data = ""
+            else:
+                # Restoration failed - delete corrupted storage data to prevent future mismatches
+                logger.warning(
+                    f"Failed to restore from storage for {self.device_name}, "
+                    "deleting corrupted data and re-provisioning"
+                )
+                self.delete_device_data()
+                # _restore_from_storage already cleared all state on failure
 
         # If storage_only mode is enabled and we got here, there's no valid stored data
         if storage_only:
@@ -715,14 +811,16 @@ class HubCertDevice:
 
     def _disconnect(self) -> None:
         """Disconnect the MQTT client and clean up resources."""
-        if self.client is not None:
+        # Store in local variable to prevent race conditions with concurrent access
+        client = self.client
+        if client is not None:
+            self.client = None  # Clear immediately to prevent other code from using it
             try:
                 logger.info(f"Disconnecting {self.device_name} from IoT Hub")
-                self.client.loop_stop()
-                self.client.disconnect()
+                client.loop_stop()
+                client.disconnect()
             except Exception as e:
                 logger.debug(f"Error disconnecting MQTT client: {e}")
-            self.client = None
 
         self.is_connected = False
         # Note: Temp files are now cleaned up immediately after SSL context loading
@@ -969,7 +1067,7 @@ class HubCertDevice:
             if request_id is not None and request_id in self.pending_requests:
                 del self.pending_requests[request_id]
 
-    def connect(self, _retry_from_storage: bool = False) -> bool:
+    def connect(self) -> bool:
         """Connect to IoT Hub via Paho MQTT.
 
         This method establishes a persistent MQTT connection and subscribes to the
@@ -980,12 +1078,7 @@ class HubCertDevice:
         If the connection was lost, it will clean up and reconnect.
 
         If a KEY_VALUES_MISMATCH error occurs (certificate/key mismatch), this method
-        will automatically reload credentials from storage and retry once. This handles
-        race conditions where in-memory state got out of sync with storage.
-
-        Args:
-            _retry_from_storage: Internal flag to prevent infinite retry loops.
-                Do not set this manually.
+        clears all state and deletes stored data, requiring a full re-provision.
 
         Returns:
             True if connection and subscription were successful, False otherwise.
@@ -1118,25 +1211,21 @@ class HubCertDevice:
             # Clean up on failure
             self._disconnect()
 
-            # Handle KEY_VALUES_MISMATCH error by reloading from storage and retrying once
-            # This handles race conditions where in-memory state got out of sync with storage
+            # Handle KEY_VALUES_MISMATCH error by deleting storage and triggering full re-provision
+            # This is the nuclear option - the key and cert are out of sync somewhere
             error_str = str(e)
-            if "KEY_VALUES_MISMATCH" in error_str and not _retry_from_storage:
+            if "KEY_VALUES_MISMATCH" in error_str:
                 logger.warning(
-                    f"Key/certificate mismatch for {self.device_name}, " "reloading from storage and retrying"
+                    f"Key/certificate mismatch for {self.device_name}, "
+                    "deleting stored data for re-provision on next attempt"
                 )
-                # Clear in-memory state (keep private_key to maintain CSR consistency)
+                # Delete the bad storage data so next provision() call will re-provision from DPS
+                self.delete_device_data()
+                # Clear ALL in-memory state including private key
+                # This forces a completely fresh provision next time
+                self._private_key = None
                 self.registration_result = None
                 self.issued_cert_data = ""
-
-                # Reload from storage
-                device_data = self.load_device_data()
-                if device_data is not None and self._restore_from_storage(device_data):
-                    logger.info(f"Reloaded credentials from storage for {self.device_name}, retrying connect")
-                    # Retry connection with reloaded data (only once)
-                    return self.connect(_retry_from_storage=True)
-                else:
-                    logger.error(f"Failed to reload credentials from storage for {self.device_name}")
 
             return False
 

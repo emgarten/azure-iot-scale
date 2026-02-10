@@ -34,7 +34,7 @@ if wheel_path.exists():
     sys.path.insert(0, str(extract_dir))
 
 from hub_cert_device import HubCertDevice  # noqa: E402
-from storage import clear_device_counter, initialize_storage  # noqa: E402
+from storage import allocate_device_id_range, clear_device_counter, initialize_storage  # noqa: E402
 
 logger = logging.getLogger("locust.cert_user_throttle")
 
@@ -57,17 +57,6 @@ def on_test_stop(environment: Any, **kwargs: Any) -> None:
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 devices_per_user = int(os.getenv("DEVICES_PER_USER", "1"))  # number of devices per user
 
-# Hub and engine configuration for distributed testing
-# Each hub runs separately with N engines, total devices split evenly across engines
-# Formula: start = (HUB_INDEX * TOTAL_DEVICES_PER_HUB) + (ENGINE_INDEX * DEVICES_PER_ENGINE)
-# This ensures globally unique device IDs across all hubs for reporting
-hub_index = int(os.getenv("HUB_INDEX", "0"))  # 0-4 for 5 hubs
-# Engine index and count from Azure Load Testing
-engine_index = int(os.getenv("AZURE_LOAD_TESTING_ENGINE_INDEX", "0"))
-engine_count = int(os.getenv("AZURE_LOAD_TEST_ENGINE_COUNT", "10"))
-# Total devices per hub, divided by engine count to get per-engine allocation
-total_devices_per_hub = int(os.getenv("TOTAL_DEVICES_PER_HUB", "250000"))  # 250k devices per hub
-devices_per_engine = total_devices_per_hub // engine_count
 
 # Rate configuration: requests per minute
 # Default: 1 request per minute per user (across all devices)
@@ -115,74 +104,56 @@ class CertUserThrottle(User):
         CERT_REQUESTS_PER_MINUTE: Target certificate requests per minute per user (default: 1)
         SEND_MAX_RATE: Send requests as fast as possible, ignoring CERT_REQUESTS_PER_MINUTE (default: "false")
         DEVICE_NAME_PREFIX: Prefix for device names (default: "device"), also used for counter isolation
-        HUB_INDEX: Which hub this run targets, used for globally unique device IDs (default: 0)
-        AZURE_LOAD_TESTING_ENGINE_INDEX: Engine index from Azure Load Testing (default: 0)
-        AZURE_LOAD_TEST_ENGINE_COUNT: Total number of engines from Azure Load Testing (default: 5)
-        TOTAL_DEVICES_PER_HUB: Total devices per hub, divided by engine count (default: 250000)
         USE_STORED_DEVICES_ONLY: Only use pre-provisioned devices from storage (default: "false")
+        DEVICE_ID_RANGE_SIZE: Number of device IDs to allocate per worker (default: 5000)
     """
 
     wait_time = constant_pacing(_calculate_wait_time())  # type: ignore[no-untyped-call]
     _storage_initialized: bool = False  # Class-level flag for one-time storage initialization
 
-    # Static device ID range based on hub and engine index
-    _id_range_lock: threading.Lock = threading.Lock()  # Lock for thread-safe ID allocation
-    _id_range_start: int = 0  # Start of range (inclusive)
-    _id_range_end: int = 0  # End of range (exclusive)
+    # Distributed device ID range allocation (per-worker, shared across all CertUserThrottle instances)
+    _id_range_lock: threading.Lock = threading.Lock()  # Lock for thread-safe ID range allocation
+    _id_range_start: int = 0  # Start of allocated range (inclusive)
+    _id_range_end: int = 0  # End of allocated range (exclusive)
     _id_range_current: int = 0  # Next ID to use within the range
-    _id_range_initialized: bool = False  # Whether range has been initialized
+    _id_range_allocated: bool = False  # Whether a range has been allocated
 
     @classmethod
-    def _ensure_id_range_initialized(cls) -> None:
-        """Initialize the static ID range based on hub and engine index (must hold _id_range_lock).
+    def _ensure_id_range_unlocked(cls) -> None:
+        """Ensure an ID range is allocated for this worker (must hold _id_range_lock).
 
-        The formula: start = (HUB_INDEX * TOTAL_DEVICES_PER_HUB) + (ENGINE_INDEX * DEVICES_PER_ENGINE)
+        This method allocates a new range from Azure Blob Storage if:
+        - No range has been allocated yet, or
+        - The current range is exhausted
 
-        For example, with 5 hubs, 5 engines each, and 250k devices per hub (50k per engine):
-        - Hub 0, Engine 0: devices 0-49999
-        - Hub 0, Engine 4: devices 200000-249999
-        - Hub 1, Engine 0: devices 250000-299999
-        - Hub 4, Engine 4: devices 1200000-1249999
-
-        This ensures globally unique device IDs across all hubs for reporting.
+        The allocation is atomic and uses ETag-based optimistic concurrency
+        to ensure non-overlapping ranges across all workers.
 
         Note: Caller must hold _id_range_lock before calling this method.
         """
-        if not cls._id_range_initialized:
-            hub_offset = hub_index * total_devices_per_hub
-            engine_offset = engine_index * devices_per_engine
-            cls._id_range_start = hub_offset + engine_offset
-            cls._id_range_end = cls._id_range_start + devices_per_engine
+        if cls._id_range_current >= cls._id_range_end:
+            logger.info(f"Allocating new device ID range for prefix '{device_name_prefix}'")
+            cls._id_range_start, cls._id_range_end = allocate_device_id_range(device_name_prefix)
             cls._id_range_current = cls._id_range_start
-            cls._id_range_initialized = True
-            logger.info(
-                f"Initialized device ID range for hub {hub_index}, engine {engine_index}/{engine_count}: "
-                f"[{cls._id_range_start}, {cls._id_range_end}) ({devices_per_engine} devices)"
-            )
+            cls._id_range_allocated = True
+            logger.info(f"Allocated device ID range [{cls._id_range_start}, {cls._id_range_end})")
 
     @classmethod
     def get_device_name(cls) -> str:
-        """Generate a unique device name using the prefix and static ID range.
+        """Generate a unique device name using the prefix and a distributed counter.
 
-        This method returns device names from the pre-calculated range based on
-        HUB_INDEX and ENGINE_INDEX. Each engine gets a unique, non-overlapping
-        range of device IDs.
+        This method ensures device names are unique across all workers by:
+        1. Allocating non-overlapping ID ranges from Azure Blob Storage
+        2. Using IDs from the allocated range locally without coordination
+        3. Automatically allocating a new range when the current one is exhausted
 
         Thread-safe: Uses a lock to prevent concurrent access from multiple threads.
 
         Returns:
             A unique device name in the format "{prefix}{id}"
-
-        Raises:
-            RuntimeError: If all device IDs in the range have been used
         """
         with cls._id_range_lock:
-            cls._ensure_id_range_initialized()
-            if cls._id_range_current >= cls._id_range_end:
-                raise RuntimeError(
-                    f"Device ID range exhausted for hub {hub_index}, engine {engine_index}: "
-                    f"used all {devices_per_engine} devices in range [{cls._id_range_start}, {cls._id_range_end})"
-                )
+            cls._ensure_id_range_unlocked()
             device_id = cls._id_range_current
             cls._id_range_current += 1
         device_name = f"{device_name_prefix}{device_id}"
@@ -222,13 +193,33 @@ class CertUserThrottle(User):
         logger.info(f"CertUserThrottle initialized with {len(self.devices)} device(s)")
 
     def on_start(self) -> None:
-        """Called when a user starts - no-op since provisioning happens lazily in tasks.
+        """Eagerly provision and connect all devices before tasks run.
 
-        Devices are provisioned and connected on first use in request_certificate(),
-        allowing early-provisioned devices to start sending requests immediately
-        while others are still being set up.
+        This prevents blocking during task execution, which would break
+        constant_pacing timing. Devices that fail to provision/connect
+        are logged but kept in the list for retry attempts during tasks.
         """
-        logger.info(f"User started with {len(self.devices)} device(s), will provision lazily")
+        logger.info(f"Starting eager initialization for {len(self.devices)} device(s)")
+
+        for i, device in enumerate(self.devices):
+            logger.info(f"Initializing device {i + 1}/{len(self.devices)}: {device.device_name}")
+
+            # Provision if not already provisioned
+            if not self._is_device_provisioned(device):
+                if not device.provision(storage_only=use_stored_devices_only):
+                    if use_stored_devices_only:
+                        logger.info(f"Device {device.device_name} not found in storage (storage-only mode)")
+                    else:
+                        logger.warning(f"Failed to provision device {device.device_name} during startup")
+                    continue  # provision() already handles connect on success
+
+            # Connect if provisioned but not connected (e.g., restored from storage without validation)
+            if not device.is_connected:
+                if not device.connect():
+                    logger.warning(f"Failed to connect device {device.device_name} during startup")
+
+        connected_count = sum(1 for d in self.devices if d.is_connected)
+        logger.info(f"Eager initialization complete: {connected_count}/{len(self.devices)} devices connected")
 
     def _get_next_device(self) -> HubCertDevice | None:
         """Get the next device in round-robin fashion.
@@ -259,39 +250,31 @@ class CertUserThrottle(User):
     def request_certificate(self) -> None:
         """Request a certificate renewal from the next device in round-robin order.
 
-        Devices are provisioned lazily on first use, so early-provisioned devices
-        start sending requests immediately while others are still being set up.
-        The request_new_certificate method handles reconnection if the connection was lost.
+        Devices are eagerly initialized in on_start(), so this task should not
+        block on provisioning or connection. The request_new_certificate method
+        handles reconnection if the connection was lost.
 
-        This task uses request_new_certificate() with use_invalid_replace=False.
-        429 and 412 responses are expected and handled gracefully.
+        This task uses request_new_certificate() with use_invalid_replace=True
+        to avoid 409 conflicts. 429 and 412 responses are expected and handled
+        gracefully.
         """
         device = self._get_next_device()
+
+        logger.info(f"Requesting certificate for device {device.device_name if device else 'N/A'}")
 
         if device is None:
             logger.warning("No devices available, skipping certificate request")
             return
 
-        # Lazily provision device on first use
-        if not self._is_device_provisioned(device):
-            logger.info(f"Provisioning device {device.device_name} on first use")
-            if not device.provision(storage_only=use_stored_devices_only):
-                if use_stored_devices_only:
-                    logger.info(f"Device {device.device_name} not found in storage (storage-only mode)")
-                else:
-                    logger.warning(f"Failed to provision device {device.device_name}")
-                return
-
-        # Connect if provisioned but not connected
-        if not device.is_connected:
-            if not device.connect():
-                logger.warning(f"Failed to connect device {device.device_name}")
-                return
-
         # Emit time since last certificate response (if available)
         time_since_last = device.get_time_since_last_cert_response()
         if time_since_last is not None:
             logger.info(f"Device {device.device_name}: {time_since_last:.2f}s since last cert response")
+
+        # Skip devices that failed to provision during on_start()
+        if not self._is_device_provisioned(device):
+            logger.debug(f"Device {device.device_name} not provisioned, skipping")
+            return
 
         device.request_new_certificate(use_invalid_replace=False)
 

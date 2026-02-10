@@ -27,12 +27,12 @@ device_data_blob_prefix = os.getenv("DEVICE_DATA_BLOB_PREFIX", "data")
 
 # Increased default for scale: 50000 IDs per range reduces counter contention
 # With 1M devices and 50000 per range, only 20 allocations needed per worker
-device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "5000"))
+device_id_range_size = int(os.getenv("DEVICE_ID_RANGE_SIZE", "50000"))
 device_name_prefix = os.getenv("DEVICE_NAME_PREFIX", "device")
 
 # Counter sharding: number of counter partitions to reduce contention
 # With N shards, max N workers can allocate simultaneously without conflict
-counter_shard_count = int(os.getenv("COUNTER_SHARD_COUNT", "25"))
+counter_shard_count = int(os.getenv("COUNTER_SHARD_COUNT", "50"))
 
 # File descriptor warning threshold for scale testing
 min_file_descriptors = int(os.getenv("MIN_FILE_DESCRIPTORS", "65536"))
@@ -315,10 +315,10 @@ def allocate_device_id_range(
     container_client = blob_service_client.get_container_client(storage_container_name)
 
     # Sharding: randomly select a shard to reduce contention
-    # Each shard has its own ID space offset by shard_id * 10_000_000_000 (10 billion)
-    # This allows up to 10 billion IDs per shard, supporting billions of devices
+    # Each shard has its own ID space offset by shard_id * 1_000_000 (1 million)
+    # This allows up to 1 million IDs per shard, supporting billions of devices
     shard_id = random.randint(0, counter_shard_count - 1)
-    shard_offset = shard_id * 10_000_000_000  # 10 billion IDs per shard
+    shard_offset = shard_id * 1_000_000  # 1 million IDs per shard
 
     blob_name = f"{counter_blob_prefix}/{device_prefix}/shard_{shard_id:03d}.json"
     blob_client = container_client.get_blob_client(blob_name)
