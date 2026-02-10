@@ -91,9 +91,9 @@ class HubCertDevice:
         """
         self.device_name = device_name
         self.environment = environment
-        # Generate the private key once at instance creation to ensure CSR consistency
-        # (allows server-side CSR hash caching)
-        self.private_key: EllipticCurvePrivateKey = ec.generate_private_key(ec.SECP256R1())
+        # Private key is lazily generated or restored from storage
+        # This prevents key mismatch when DPS has cached registrations
+        self._private_key: Optional[EllipticCurvePrivateKey] = None
         self.issued_cert_data: str = ""
         self.registration_result: Optional[RegistrationResult] = None
 
@@ -115,6 +115,38 @@ class HubCertDevice:
         # Event for connection synchronization (replaces busy-wait loop)
         # Uses gevent.Event instead of threading.Event to yield to other greenlets during wait()
         self._connect_event: GeventEvent = GeventEvent()
+
+        # Track successful certificate requests (Azure IoT Hub limits to 20 per device)
+        self.successful_cert_requests: int = 0
+
+    @property
+    def private_key(self) -> EllipticCurvePrivateKey:
+        """Get the private key, generating one if needed.
+
+        The private key is lazily generated to allow restoration from storage
+        before DPS provisioning. This prevents key mismatch errors when DPS
+        has cached registrations from previous runs.
+
+        Returns:
+            The device's EC private key.
+        """
+        if self._private_key is None:
+            self._private_key = ec.generate_private_key(ec.SECP256R1())
+            logger.debug(f"Generated new private key for {self.device_name}")
+        return self._private_key
+
+    @private_key.setter
+    def private_key(self, value: EllipticCurvePrivateKey) -> None:
+        """Set the private key (used when restoring from storage)."""
+        self._private_key = value
+
+    def has_reached_cert_limit(self) -> bool:
+        """Check if this device has reached the 20 certificate request limit.
+
+        Returns:
+            True if the device has reached or exceeded 20 successful requests, False otherwise.
+        """
+        return self.successful_cert_requests >= 20
 
     def _is_actually_connected(self) -> bool:
         """Check if MQTT client is actually connected.
@@ -821,9 +853,13 @@ class HubCertDevice:
             if payload_data and "certificates" in payload_data:
                 cert_data = payload_data["certificates"]
                 if isinstance(cert_data, list) and len(cert_data) > 0:
-                    # Certificate chain received - record timestamp
+                    # Certificate chain received - record timestamp and increment counter
                     self.last_cert_chain_response_time = time.time()
-                    logger.info(f"Certificate chain received for {self.device_name}")
+                    self.successful_cert_requests += 1
+                    logger.info(
+                        f"Certificate chain received for {self.device_name} "
+                        f"({self.successful_cert_requests}/20 requests)"
+                    )
                     gevent.spawn(
                         self._fire_locust_event,
                         name="credential_certificate",

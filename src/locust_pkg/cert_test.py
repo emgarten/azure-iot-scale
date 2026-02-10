@@ -29,7 +29,7 @@ from cryptography.x509.oid import NameOID
 # Constants
 MESSAGE_INTERVAL = 5  # seconds
 MESSAGE_SIZE = 256  # bytes
-DEFAULT_PROVISIONING_HOST = "global.azure-devices-provisioning.net"
+DEFAULT_PROVISIONING_HOST = "global-canary.azure-devices-provisioning.net"
 DEFAULT_DEVICE_NAME = "test-device"
 MQTT_PORT = 8883
 API_VERSION = "2025-08-01-preview"
