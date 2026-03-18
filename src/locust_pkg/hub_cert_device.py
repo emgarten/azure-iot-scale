@@ -9,7 +9,6 @@ Designed for load testing certificate renewal operations.
 import base64
 import hashlib
 import hmac
-import json
 import logging
 import os
 import random
@@ -21,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
 import gevent
+import orjson
 import paho.mqtt.client as mqtt
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -49,6 +49,23 @@ credential_response_timeout = int(os.getenv("CREDENTIAL_RESPONSE_TIMEOUT", "300"
 # MQTT keepalive in seconds - Azure IoT Hub recommends 230s for reliable connections
 # Lower values (like 60s) can cause frequent rc=7 (MQTT_ERR_CONN_LOST) under load
 MQTT_KEEPALIVE = int(os.getenv("MQTT_KEEPALIVE", "230"))
+
+# MQTT disconnect reason codes (from Paho MQTT)
+# These help diagnose connection issues during scale testing
+MQTT_RC_DESCRIPTIONS: dict[int, str] = {
+    0: "clean_disconnect",
+    1: "protocol_error",
+    2: "invalid_client_id",
+    3: "server_unavailable",
+    4: "bad_credentials",
+    5: "not_authorized",
+    7: "connection_lost",  # Socket-level disconnect
+    8: "tls_error",
+    11: "auth_error",
+    12: "acl_denied",
+    14: "socket_error",
+    16: "keepalive_timeout",  # No PINGRESP within keepalive window
+}
 
 
 class RegistrationState:
@@ -120,11 +137,26 @@ class HubCertDevice:
         # Uses gevent.Event instead of threading.Event to yield to other greenlets during wait()
         self._connect_event: GeventEvent = GeventEvent()
 
+        # Event for subscription synchronization - wait for SUBACK before publishing
+        self._subscribe_event: GeventEvent = GeventEvent()
+
         # Track successful certificate requests (Azure IoT Hub limits to 20 per device)
         self.successful_cert_requests: int = 0
 
         # Guard to prevent concurrent reconnection attempts
         self._reconnecting: bool = False
+
+        # Cached SSL Context to avoid disk I/O on reconnects
+        self._ssl_context: Optional[ssl.SSLContext] = None
+
+        # Expected hub index for validation (optional, set via provision())
+        # Hub names follow the pattern: prefix-XXX.azure-devices.net where XXX = hub_index + 1
+        self._expected_hub_index: Optional[int] = None
+
+        # Track consecutive disconnect count to reduce error noise
+        # Only fire Locust errors after multiple consecutive unexpected disconnects
+        self._consecutive_disconnects: int = 0
+        self._disconnect_error_threshold: int = 3  # Fire error after this many consecutive disconnects
 
     @property
     def private_key(self) -> EllipticCurvePrivateKey:
@@ -171,6 +203,47 @@ class HubCertDevice:
             return False
         return bool(self.client.is_connected())
 
+    def _validate_hub_assignment(self, assigned_hub: str) -> bool:
+        """Validate that the assigned hub matches the expected hub index.
+
+        Hub names follow the pattern: prefix-XXX.azure-devices.net where XXX is
+        the 0-padded hub number. The expected hub number is _expected_hub_index + 1.
+
+        For example:
+        - expected_hub_index=0 expects hub names containing "-001" (e.g., ruath-scale-001)
+        - expected_hub_index=1 expects hub names containing "-002" (e.g., ruath-scale-002)
+
+        Args:
+            assigned_hub: The assigned hub hostname from DPS registration
+
+        Returns:
+            True if the hub assignment is valid or no expected_hub_index is set,
+            False if there's a mismatch.
+        """
+        if self._expected_hub_index is None:
+            # No validation required if expected_hub_index not set
+            return True
+
+        # Expected hub number is index + 1, zero-padded to 3 digits
+        expected_hub_number = f"-{self._expected_hub_index + 1:03d}"
+
+        # Extract the hub name part (before .azure-devices.net)
+        hub_name = assigned_hub.split(".")[0] if "." in assigned_hub else assigned_hub
+
+        if expected_hub_number not in hub_name:
+            logger.warning(
+                f"Hub assignment mismatch for {self.device_name}: "
+                f"expected hub index {self._expected_hub_index} (number {expected_hub_number}), "
+                f"but assigned to '{assigned_hub}'"
+            )
+            return False
+
+        logger.debug(
+            f"Hub assignment validated for {self.device_name}: "
+            f"expected hub index {self._expected_hub_index}, assigned to '{assigned_hub}'"
+        )
+        return True
+
     def _cleanup_pending_requests(self, max_age_seconds: float = 600) -> None:
         """Clean up stale pending requests that have timed out.
 
@@ -215,10 +288,16 @@ class HubCertDevice:
             rc: Result code (0 = success, non-zero = failure)
         """
         if rc == 0:
+            was_previously_connected = self._consecutive_disconnects > 0
             self.is_connected = True
             self._last_disconnect_rc = None
+            self._consecutive_disconnects = 0  # Reset on successful connection
             self._connect_event.set()  # Signal successful connection
-            logger.info(f"MQTT connected for {self.device_name}")
+            # Log reconnections at debug level to reduce noise under frequent disconnect/reconnect cycles
+            if was_previously_connected:
+                logger.debug(f"MQTT reconnected for {self.device_name}")
+            else:
+                logger.info(f"MQTT connected for {self.device_name}")
         else:
             self.is_connected = False
             logger.error(f"MQTT connection failed for {self.device_name}, rc={rc}")
@@ -257,16 +336,31 @@ class HubCertDevice:
         if rc != 0:
             # Unexpected disconnection - log at debug level to reduce noise
             # (reconnection will be attempted automatically)
-            logger.debug(f"Unexpected MQTT disconnect for {self.device_name}, rc={rc}")
-            if was_connected:
+            self._consecutive_disconnects += 1
+            rc_desc = MQTT_RC_DESCRIPTIONS.get(rc, f"unknown_{rc}")
+            logger.debug(
+                f"Unexpected MQTT disconnect for {self.device_name}, rc={rc} ({rc_desc}) "
+                f"(consecutive: {self._consecutive_disconnects})"
+            )
+            # Only fire Locust error after multiple consecutive disconnects
+            # This reduces noise from transient network issues that auto-reconnect handles
+            if was_connected and self._consecutive_disconnects >= self._disconnect_error_threshold:
                 self.environment.events.request.fire(
                     request_type="Hub",
-                    name="disconnect_error",
+                    name=f"disconnect_{rc_desc}",
                     response_time=0,
                     response_length=0,
-                    exception=f"Unexpected disconnect with rc={rc}",
-                    context={"device_name": self.device_name, "rc": rc},
+                    exception=f"Persistent disconnect: {rc_desc} (rc={rc}, count: {self._consecutive_disconnects})",
+                    context={
+                        "device_name": self.device_name,
+                        "rc": rc,
+                        "reason": rc_desc,
+                        "count": self._consecutive_disconnects,
+                    },
                 )
+                # Reset counter after firing error to allow another batch
+                self._consecutive_disconnects = 0
+            if was_connected:
                 # Spawn automatic reconnection attempt using gevent
                 # This marshals to the greenlet context and avoids blocking the Paho thread
                 gevent.spawn(self._auto_reconnect)
@@ -277,6 +371,28 @@ class HubCertDevice:
         if self.pending_requests:
             logger.debug(f"Clearing {len(self.pending_requests)} pending requests on disconnect for {self.device_name}")
             self.pending_requests.clear()
+
+    def _on_subscribe(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        mid: int,
+        granted_qos: list[int],
+    ) -> None:
+        """Handle MQTT subscription acknowledgement (SUBACK).
+
+        This callback is invoked when the broker acknowledges our subscription.
+        We must wait for this before publishing to ensure the broker is ready
+        to route responses back to us.
+
+        Args:
+            client: The MQTT client instance
+            userdata: User data (unused)
+            mid: Message ID of the subscribe request
+            granted_qos: List of granted QoS levels for each topic
+        """
+        logger.debug(f"Subscription acknowledged for {self.device_name}, mid={mid}, qos={granted_qos}")
+        self._subscribe_event.set()
 
     def _auto_reconnect(self) -> None:
         """Attempt automatic reconnection after an unexpected disconnect.
@@ -495,7 +611,17 @@ class HubCertDevice:
                 registration_state=reg_state,
             )
 
-            # Only set instance state after ALL parsing succeeded
+            # Validate hub assignment before accepting the restored data
+            # This catches devices that were registered to a different hub than expected
+            if not self._validate_hub_assignment(device_data["assigned_hub"]):
+                logger.warning(
+                    f"Hub assignment validation failed for {self.device_name}, "
+                    f"rejecting stored data to force re-provisioning"
+                )
+                # Return False to trigger re-provisioning with correct hub assignment
+                return False
+
+            # Only set instance state after ALL parsing and validation succeeded
             # This prevents partial state on failure
             self._private_key = restored_private_key
             self.issued_cert_data = restored_cert_data
@@ -593,6 +719,28 @@ class HubCertDevice:
                 registration_state=reg_state,
             )
 
+            # Validate hub assignment for newly provisioned device
+            if not self._validate_hub_assignment(dps_result.registration_state.assigned_hub):
+                # # Hub mismatch from DPS - this indicates a routing issue
+                # total_time = int((time.time() - start_time) * 1000)
+                # error_msg = (
+                #     f"Hub assignment mismatch: device {self.device_name} was assigned to "
+                #     f"'{dps_result.registration_state.assigned_hub}' but expected hub index "
+                #     f"{self._expected_hub_index}"
+                # )
+                # logger.error(error_msg)
+                # self.environment.events.request.fire(
+                #     request_type="DPS",
+                #     name="device_provision",
+                #     response_time=total_time,
+                #     response_length=0,
+                #     exception=error_msg,
+                #     context={"registration_id": self.device_name, "status": "hub_mismatch"},
+                # )
+                # Clear the registration result since it's invalid
+                self.registration_result = None
+                return
+
             # Store the issued certificate data
             if dps_result.registration_state.issued_client_certificate:
                 self.issued_cert_data = x509_certificate_list_to_pem(
@@ -652,10 +800,10 @@ class HubCertDevice:
 
     def _connect_with_retry(
         self,
-        max_attempts: int = 3,
+        max_attempts: int = 10,
         base_wait: int = 30,
         max_jitter: int = 15,
-        total_timeout: float = 300,
+        total_timeout: float = 600,
     ) -> bool:
         """Attempt to connect with retry logic and total timeout.
 
@@ -711,13 +859,17 @@ class HubCertDevice:
 
         return False
 
-    def provision(self, storage_only: bool = False) -> bool:
+    def provision(self, storage_only: bool = False, expected_hub_index: Optional[int] = None) -> bool:
         """Provision the device with DPS.
 
         This method first tries to load existing registration from storage.
         If found, it validates the data by attempting to connect to the hub.
         If the connection fails after multiple retries (e.g., expired certificate),
         it deletes the bad data and falls back to DPS provisioning (unless storage_only=True).
+
+        If expected_hub_index is provided, the assigned hub is validated to ensure
+        the device was routed to the correct hub. Hub names follow the pattern
+        prefix-XXX.azure-devices.net where XXX = expected_hub_index + 1.
 
         After successful DPS provisioning, it also validates by connecting.
         The connection is kept open for efficiency.
@@ -726,11 +878,17 @@ class HubCertDevice:
             storage_only: If True, only load from storage and don't provision via DPS.
                          Returns False if no stored data exists. Useful for load testing
                          with pre-provisioned devices.
+            expected_hub_index: If provided, validates that the assigned hub matches
+                               this index. Hub number = expected_hub_index + 1.
+                               For example, index 0 expects hub "-001".
 
         Returns:
             True if device is successfully provisioned and connected,
             False otherwise.
         """
+        # Set expected hub index for validation
+        self._expected_hub_index = expected_hub_index
+
         # Check if a registration result already exists in device data storage
         device_data = self.load_device_data()
 
@@ -745,24 +903,25 @@ class HubCertDevice:
                         # Keep connection open for efficiency
                         return True
                     else:
-                        # Connection failed after retries - certificate may be expired or invalid
+                        # Connection failed after retries - may be transient throttling, keep data for next attempt
                         logger.warning(
                             f"Failed to connect with loaded registration for {self.device_name} after retries, "
-                            "deleting bad data and re-provisioning"
+                            "keeping stored data for retry on next run"
                         )
-                        self.delete_device_data()
+                        # Don't delete device data - connection failure under load is often transient
+                        # self.delete_device_data()
                         # Clear registration and cert but KEEP the private key
                         # This ensures the CSR sent to DPS uses the same key, which
                         # prevents key/cert mismatch if DPS returns cached data
                         self.registration_result = None
                         self.issued_cert_data = ""
             else:
-                # Restoration failed - delete corrupted storage data to prevent future mismatches
+                # Restoration failed - keep storage data for debugging, clear in-memory state
                 logger.warning(
-                    f"Failed to restore from storage for {self.device_name}, "
-                    "deleting corrupted data and re-provisioning"
+                    f"Failed to restore from storage for {self.device_name}, " "keeping stored data, will re-provision"
                 )
-                self.delete_device_data()
+                # Don't delete device data - preserve for debugging and retry
+                # self.delete_device_data()
                 # _restore_from_storage already cleared all state on failure
 
         # If storage_only mode is enabled and we got here, there's no valid stored data
@@ -798,11 +957,10 @@ class HubCertDevice:
             # Keep connection open for efficiency
             return True
         else:
-            # Connection failed after provisioning and retries - delete the saved data
-            logger.error(
-                f"Failed to connect after provisioning {self.device_name} (after retries), deleting saved data"
-            )
-            self.delete_device_data()
+            # Connection failed after provisioning - keep saved data for retry on next run
+            logger.error(f"Failed to connect after provisioning {self.device_name} (after retries), keeping saved data")
+            # Don't delete device data - DPS provisioning succeeded, connection failure is likely transient
+            # self.delete_device_data()
             return False
 
     def disconnect(self) -> None:
@@ -919,8 +1077,8 @@ class HubCertDevice:
         if msg.payload:
             try:
                 payload_str = msg.payload.decode("utf-8")
-                payload_data = json.loads(payload_str)
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                payload_data = orjson.loads(payload_str)
+            except (orjson.JSONDecodeError, UnicodeDecodeError) as e:
                 # Emit parse error event via gevent to marshal to greenlet context
                 logger.error(f"Error parsing credential response: {e}")
                 gevent.spawn(
@@ -1107,43 +1265,38 @@ class HubCertDevice:
         start_time = time.time()
 
         try:
-            # Serialize the private key to PEM format (in-memory, no temp files)
-            private_key_pem = self.private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
+            if self._ssl_context is None:
+                # Serialize the private key to PEM format (in-memory, no temp files)
+                private_key_pem = self.private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
 
-            # Load certificate and key directly into SSL context (no temp files)
-            # This is critical for scale - temp files create disk I/O and inode pressure
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ssl_context.check_hostname = True
-            # Write certificate and key to temporary files, load into SSL context,
-            # then immediately delete the temp files. This is necessary because
-            # ssl.SSLContext.load_cert_chain() doesn't support loading from memory
-            # in Python < 3.13. Immediate cleanup minimizes disk/inode pressure at scale.
-            cert_fd, temp_cert_file = tempfile.mkstemp(suffix=".pem", text=True)
-            key_fd, temp_key_file = tempfile.mkstemp(suffix=".pem", text=True)
-            try:
-                with os.fdopen(cert_fd, "w") as f:
-                    f.write(self.issued_cert_data)
-                with os.fdopen(key_fd, "wb") as f:
-                    f.write(private_key_pem)
+                # Write certificate and key to temporary files, load into SSL context,
+                # then immediately delete the temp files.
+                cert_fd, temp_cert_file = tempfile.mkstemp(suffix=".pem", text=True)
+                key_fd, temp_key_file = tempfile.mkstemp(suffix=".pem", text=True)
+                try:
+                    with os.fdopen(cert_fd, "w") as f:
+                        f.write(self.issued_cert_data)
+                    with os.fdopen(key_fd, "wb") as f:
+                        f.write(private_key_pem)
 
-                # Create SSL context and load certs
-                ssl_context = ssl.create_default_context()
-                ssl_context.load_cert_chain(certfile=temp_cert_file, keyfile=temp_key_file)
-            finally:
-                # Clean up temp files immediately after loading into SSL context
-                # This minimizes disk usage and inode consumption at scale
-                try:
-                    os.unlink(temp_cert_file)
-                except OSError:
-                    pass
-                try:
-                    os.unlink(temp_key_file)
-                except OSError:
-                    pass
+                    # Create SSL context and load certs
+                    self._ssl_context = ssl.create_default_context()
+                    self._ssl_context.load_cert_chain(certfile=temp_cert_file, keyfile=temp_key_file)
+                    logger.debug(f"Created new SSL context for {self.device_name}")
+                finally:
+                    # Clean up temp files immediately
+                    try:
+                        os.unlink(temp_cert_file)
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(temp_key_file)
+                    except OSError:
+                        pass
 
             # Create MQTT client
             self.client = mqtt.Client(
@@ -1151,22 +1304,28 @@ class HubCertDevice:
                 protocol=mqtt.MQTTv311,
             )
 
+            # Enable Paho's built-in reconnect with exponential backoff
+            # This provides a more graceful reconnection mechanism
+            # min_delay=1s, max_delay=120s - Paho will double delay on each failure
+            self.client.reconnect_delay_set(min_delay=1, max_delay=120)
+
             # Set username for Azure IoT Hub
             username = f"{hostname}/{device_id}/?api-version={API_VERSION}"
             self.client.username_pw_set(username=username)
 
             # Configure TLS with loaded SSL context
-            self.client.tls_set_context(ssl_context)
+            self.client.tls_set_context(self._ssl_context)
 
             # Set callbacks for connection state tracking
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
             self.client.on_message = self._credential_on_message
+            self.client.on_subscribe = self._on_subscribe
 
             # Connect to IoT Hub
             logger.debug(f"Connecting to {hostname} via MQTT")
             self._connect_event.clear()  # Reset event before connection attempt
-            self.client.connect(hostname, MQTT_PORT, keepalive=60)
+            self.client.connect(hostname, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
             self.client.loop_start()
 
             # Wait for connection using event-based synchronization (avoids busy-wait)
@@ -1174,11 +1333,18 @@ class HubCertDevice:
             if not self._connect_event.wait(timeout=connect_timeout):
                 raise Exception("Failed to connect to IoT Hub via MQTT (timeout)")
 
-            # Subscribe to response topic (once, for the lifetime of the connection)
+            # Subscribe to response topic and wait for SUBACK before proceeding
+            # This ensures the broker is ready to route responses back to us
             subscribe_topic = "$iothub/credentials/res/#"
+            self._subscribe_event.clear()
             result, _ = self.client.subscribe(subscribe_topic, qos=1)
             if result != mqtt.MQTT_ERR_SUCCESS:
                 raise Exception(f"Failed to subscribe to {subscribe_topic}")
+
+            # Wait for subscription acknowledgement (SUBACK)
+            subscribe_timeout = 30
+            if not self._subscribe_event.wait(timeout=subscribe_timeout):
+                raise Exception(f"Subscription to {subscribe_topic} not acknowledged (timeout)")
 
             self.is_connected = True
 
@@ -1211,19 +1377,19 @@ class HubCertDevice:
             # Clean up on failure
             self._disconnect()
 
-            # Handle KEY_VALUES_MISMATCH error by deleting storage and triggering full re-provision
-            # This is the nuclear option - the key and cert are out of sync somewhere
+            # Handle KEY_VALUES_MISMATCH error - clear in-memory state but keep storage data
             error_str = str(e)
             if "KEY_VALUES_MISMATCH" in error_str:
                 logger.warning(
                     f"Key/certificate mismatch for {self.device_name}, "
-                    "deleting stored data for re-provision on next attempt"
+                    "clearing in-memory state for re-provision on next attempt"
                 )
-                # Delete the bad storage data so next provision() call will re-provision from DPS
-                self.delete_device_data()
-                # Clear ALL in-memory state including private key
+                # Don't delete storage data - preserve for debugging
+                # self.delete_device_data()
+                # Clear ALL in-memory state including private key and SSL context
                 # This forces a completely fresh provision next time
                 self._private_key = None
+                self._ssl_context = None
                 self.registration_result = None
                 self.issued_cert_data = ""
 
@@ -1305,16 +1471,21 @@ class HubCertDevice:
                 payload_dict["replace"] = "invalid"
             elif replace:
                 payload_dict["replace"] = "*"
-            payload = json.dumps(payload_dict)
+            payload = orjson.dumps(payload_dict)
 
             logger.debug(f"Sending credential request to {publish_topic}")
-            # At this point client is guaranteed to be non-None (checked above)
-            assert self.client is not None
+            # Guard against race condition where client could be set to None
+            # between successful connect() and this point (e.g., unexpected disconnect)
+            if self.client is None:
+                raise Exception("MQTT client is None after successful connect - possible race condition")
 
             # Always re-subscribe before publishing to ensure subscription is active
-            # (subscriptions are idempotent - subscribing twice is harmless)
+            # and wait for SUBACK to ensure broker is ready to route responses
             subscribe_topic = "$iothub/credentials/res/#"
+            self._subscribe_event.clear()
             self.client.subscribe(subscribe_topic, qos=1)
+            if not self._subscribe_event.wait(timeout=90):
+                raise Exception("Re-subscription not acknowledged (timeout)")
 
             result = self.client.publish(publish_topic, payload=payload, qos=1)
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
